@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+dynamic = ["version"]
+name = "alchemiscalehpc"
+authors = [
+  {name = "Ian Kenney", email = "ianmichaelkenney@gmail.com"},
+]
+maintainers = [
+  {name = "Ian Kenney", email = "ianmichaelkenney@gmail.com"},
+]
+description = "alchemiscale tools for use with HPC systems"
+readme = "README.md"
+license = "MIT"
+
+[project.urls]
+Repository = "https://github.com/datryllic/alchemiscale-hpc"
+Issues = "https://github.com/datryllic/alchemiscale-hpc/issues"
