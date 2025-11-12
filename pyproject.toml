@@ -4,11 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 dynamic = ["version"]
-name = "alchemiscalehpc"
+name = "alchemiscale_hpc"
 authors = [
+  {name = "David L. Dotson", email = "david@datryllic.com"},
   {name = "Ian Kenney", email = "ianmichaelkenney@gmail.com"},
 ]
 maintainers = [
+  {name = "David L. Dotson", email = "david@datryllic.com"},
   {name = "Ian Kenney", email = "ianmichaelkenney@gmail.com"},
 ]
 description = "alchemiscale tools for use with HPC systems"
@@ -18,3 +20,9 @@ license = "MIT"
 [project.urls]
 Repository = "https://github.com/datryllic/alchemiscale-hpc"
 Issues = "https://github.com/datryllic/alchemiscale-hpc/issues"
+
+[project.scripts]
+alchemiscale-hpc = "alchemiscale_hpc.cli:cli"
+
+[project.optional-dependencies]
+test = ["pytest"]
