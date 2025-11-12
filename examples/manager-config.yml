@@ -1,0 +1,75 @@
+# Example configuration file for SlurmManager
+#
+# This file configures the compute manager that autoscales compute services
+# by submitting SLURM batch jobs based on task availability.
+
+# Unique name for this manager (required)
+# Should be distinct from all other compute managers
+name: "my-slurm-manager"
+
+# Path to SLURM job script template (required)
+# The manager will use this template to generate job scripts
+job_script_template: "/path/to/slurm-job-template.sh"
+
+# Maximum number of concurrent compute services (required)
+# The manager will not exceed this number of running jobs
+max_compute_services: 10
+
+# SLURM-specific settings (optional)
+# If not specified, SLURM will use defaults
+
+# SLURM partition to submit jobs to
+partition: "gpu"
+
+# SLURM account to charge jobs to
+account: "myaccount"
+
+# Quality of Service specification
+qos: "normal"
+
+# Prefix for SLURM job names
+# Full job name will be: <prefix>-<uuid>
+job_name_prefix: "alchemiscale"
+
+# Manager behavior settings
+
+# Time in seconds to sleep between manager cycles (default: 1800)
+# The manager checks for new tasks and scales services every sleep_interval seconds
+sleep_interval: 900  # 15 minutes
+
+# Maximum number of jobs to submit per cycle (default: 1)
+# Increase this to scale up faster, but be cautious of overwhelming SLURM
+max_submit_per_cycle: 2
+
+# Cleanup settings
+
+# Whether to track and cleanup completed jobs (default: true)
+cleanup_completed_jobs: true
+
+# Whether to track and cleanup failed jobs (default: true)
+cleanup_failed_jobs: true
+
+# Logging settings
+
+# Log level (default: "WARN")
+# Options: DEBUG, INFO, WARN, ERROR
+loglevel: "INFO"
+
+# Path to log file (optional)
+# If not set, logs only go to STDOUT
+logfile: "/path/to/logs/manager.log"
+
+# SLURM command overrides (optional)
+# Only change these if your SLURM commands are non-standard
+
+# Command to submit jobs (default: "sbatch")
+# submit_command: "sbatch"
+
+# Command to cancel jobs (default: "scancel")
+# cancel_command: "scancel"
+
+# Command to query job queue (default: "squeue")
+# query_command: "squeue"
+
+# Command to query accounting (default: "sacct")
+# accounting_command: "sacct"

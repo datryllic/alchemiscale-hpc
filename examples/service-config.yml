@@ -1,0 +1,92 @@
+# Example configuration file for compute service
+#
+# This file configures the compute service that will be started by SLURM jobs.
+# The manager will pass the compute_manager_id automatically.
+
+# Compute API endpoint (required)
+api_url: "https://alchemiscale.example.com:1841"
+
+# Compute identity credentials (required)
+identifier: "my-compute-identity"
+key: "secret-compute-key"
+
+# Service name for provenance tracking (required)
+# This identifies the compute resource (e.g., HPC cluster name)
+name: "my-hpc-cluster"
+
+# Filesystem paths (required)
+
+# Path for ProtocolDAG shared space
+shared_basedir: "/scratch/alchemiscale/shared"
+
+# Path for ProtocolUnit scratch space
+scratch_basedir: "/scratch/alchemiscale/scratch"
+
+# Whether to keep shared/scratch directories after completion (default: false)
+keep_shared: false
+keep_scratch: false
+
+# Task execution settings
+
+# Scopes to claim tasks from (optional)
+# If not specified, will claim from all accessible scopes
+# Format: org-campaign-project or org-* or org-campaign-*
+scopes:
+  - "my-org-*-*"  # All campaigns and projects in my-org
+
+# Protocol names to run (optional)
+# If specified, only tasks for these protocols will be claimed
+# If null, no restriction on protocol types
+protocols: null
+
+# Maximum number of tasks to claim at once (default: 1)
+claim_limit: 1
+
+# Number of retries for failed tasks (default: 3)
+n_retries: 3
+
+# Service lifecycle settings
+
+# Time in seconds to sleep if no tasks available (default: 30)
+sleep_interval: 60
+
+# Time in seconds to sleep if claim denied by API (default: 300)
+deep_sleep_interval: 600
+
+# Frequency of heartbeats to compute API in seconds (default: 300)
+heartbeat_interval: 300
+
+# Client settings
+
+# Whether to use local disk cache (default: false)
+client_use_local_cache: true
+
+# Cache directory (optional)
+# If null, uses XDG_CACHE_HOME or ${HOME}/.cache/alchemiscale
+client_cache_directory: "/scratch/alchemiscale/cache"
+
+# Maximum cache size in bytes (default: 1 GiB)
+client_cache_size_limit: 1073741824
+
+# Maximum number of API retries (default: 5)
+# Set to -1 for unlimited retries
+client_max_retries: 10
+
+# Base seconds for exponential backoff (default: 2.0)
+client_retry_base_seconds: 2.0
+
+# Maximum seconds between retries (default: 60.0)
+client_retry_max_seconds: 120.0
+
+# Whether to verify SSL certificates (default: true)
+client_verify: true
+
+# Logging settings
+
+# Log level (default: "WARN")
+# Options: DEBUG, INFO, WARN, ERROR
+loglevel: "INFO"
+
+# Path to log file (optional)
+# If not set, logs only go to STDOUT
+logfile: "/scratch/alchemiscale/logs/service.log"
