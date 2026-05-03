@@ -1,278 +1,239 @@
 """SLURM-based compute manager for alchemiscale."""
 
-import subprocess
-import tempfile
 import re
+import subprocess
 from pathlib import Path
-from uuid import uuid4
-from typing import Set, List, Dict
+from typing import Dict, List, Set
 
-from ..base import HPCManager, HPCBatchApi, JobNotFoundError, JobFailureError
+from ..base import (
+    HPCBatchApi,
+    JobFailureError,
+    JobNotFoundError,
+    ScriptTemplateHPCManager,
+)
 from .settings import SlurmManagerSettings
+
+# SLURM job states considered "failed" for health-check purposes.
+SLURM_FAILED_STATES = "FAILED,TIMEOUT,CANCELLED,NODE_FAIL,PREEMPTED"
+
+
+def _whoami() -> str:
+    """Return the current username, used to scope SLURM queries."""
+    return subprocess.check_output(["whoami"], text=True).strip()
 
 
 class SlurmBatchApi(HPCBatchApi):
     """Helper class for interacting with SLURM batch system."""
 
+    settings: SlurmManagerSettings
+
     def __init__(self, settings: SlurmManagerSettings):
-        """Initialize SLURM batch API.
-
-        Parameters
-        ----------
-        settings : SlurmManagerSettings
-            Settings for the SLURM manager.
-        """
         super().__init__(settings)
-        self.settings: SlurmManagerSettings = settings
 
-    def check_job_health(self):
-        """Check if any tracked jobs have failed.
+    # ------------------------------------------------------------------
+    # HPCBatchApi interface
+    # ------------------------------------------------------------------
 
-        Raises
-        ------
-        JobFailureError
-            If any tracked job has failed status.
-        """
+    def check_job_health(self) -> None:
+        """Raise :class:`JobFailureError` if any tracked job has failed."""
         failed_jobs = self._get_failed_jobs()
-        tracked_failed = [job for job in failed_jobs if job["job_id"] in self.tracked_jobs]
+        tracked_failed = [
+            job for job in failed_jobs if job["job_id"] in self.tracked_jobs
+        ]
 
         if tracked_failed:
-            job_ids = ", ".join([job["job_id"] for job in tracked_failed])
+            job_ids = ", ".join(job["job_id"] for job in tracked_failed)
             raise JobFailureError(
-                f"Job(s) {job_ids} failed. Check logs and cleanup before restarting the manager."
+                f"Job(s) {job_ids} failed. "
+                "Check logs and cleanup before restarting the manager."
             )
 
-    def verify_running_jobs(self, server_job_names: Set[str]):
-        """Verify that all running jobs are registered with the server.
+    def verify_running_jobs(self, server_job_names: Set[str]) -> None:
+        """Verify each running SLURM job has a corresponding registered service.
 
-        Parameters
-        ----------
-        server_job_names : Set[str]
-            Set of job names reported by the alchemiscale server.
+        ``server_job_names`` is the set of compute service ``name`` values
+        reported by the alchemiscale server (extracted from
+        ``ComputeServiceID`` strings of the form ``"{name}-{uuid_hex}"``).
+        SLURM jobs submitted by this manager use the same value as both their
+        SLURM job name and the compute service ``--name``, so each running
+        SLURM job's name should appear in ``server_job_names``.
 
         Raises
         ------
         JobNotFoundError
-            If a running job is not registered with the server.
+            If a running job submitted by this manager is not registered with
+            the server.
         """
         running_jobs = self._get_running_jobs()
 
         for job in running_jobs:
             job_name = job["name"]
-            # Extract base name (before UUID) to match server format
-            if job_name.startswith(self.settings.job_name_prefix):
-                if job_name not in server_job_names:
-                    raise JobNotFoundError(
-                        f"Job {job_name} (SLURM ID: {job['job_id']}) not reported by server. "
-                        "Possible registration issues."
-                    )
+            if not job_name.startswith(self.settings.job_name_prefix):
+                # Not one of ours; skip.
+                continue
+            if job_name not in server_job_names:
+                raise JobNotFoundError(
+                    f"Job {job_name} (SLURM ID: {job['job_id']}) is running "
+                    "but not registered with the server. "
+                    "Check that the SLURM job script passes "
+                    '`--name "{{ JOB_NAME }}"` to '
+                    "`alchemiscale compute synchronous`."
+                )
 
-    def clear_successful_jobs(self):
-        """Track completed jobs for cleanup if configured."""
-        if self.settings.cleanup_completed_jobs:
-            completed_jobs = self._get_completed_jobs()
-            # Remove from tracking set
-            for job in completed_jobs:
-                self.tracked_jobs.discard(job["job_id"])
+    def untrack_completed_jobs(self) -> None:
+        """Remove completed jobs from the in-memory tracking set."""
+        if not self.settings.untrack_completed_jobs:
+            return
+        for job in self._get_completed_jobs():
+            self.tracked_jobs.discard(job["job_id"])
 
-    def clear_failed_jobs(self):
-        """Remove failed jobs from tracking if configured."""
-        if self.settings.cleanup_failed_jobs:
-            failed_jobs = self._get_failed_jobs()
-            # Remove from tracking set
-            for job in failed_jobs:
-                self.tracked_jobs.discard(job["job_id"])
+    def untrack_failed_jobs(self) -> None:
+        """Remove failed jobs from the in-memory tracking set."""
+        if not self.settings.untrack_failed_jobs:
+            return
+        for job in self._get_failed_jobs():
+            self.tracked_jobs.discard(job["job_id"])
 
     def jobs_pending(self) -> bool:
-        """Check if any tracked jobs are pending (not yet running).
-
-        Returns
-        -------
-        bool
-            True if any jobs are in pending state.
-        """
-        pending_jobs = self._get_pending_jobs()
-        return any(job["job_id"] in self.tracked_jobs for job in pending_jobs)
+        """Return True if any tracked jobs are in PENDING state."""
+        pending = self._get_pending_jobs()
+        return any(job["job_id"] in self.tracked_jobs for job in pending)
 
     def get_jobs(self) -> List[Dict[str, str]]:
-        """Get all jobs in the queue.
-
-        Returns
-        -------
-        List[Dict[str, str]]
-            List of job dictionaries with keys: job_id, name, state
-        """
+        """Get all jobs in the queue for the current user."""
         cmd = [
             self.settings.query_command,
-            "-u", subprocess.check_output(["whoami"]).decode().strip(),
-            "-o", "%i,%j,%T",  # job_id, name, state
-            "--noheader"
+            "-u",
+            _whoami(),
+            "-o",
+            "%i,%j,%T",  # job_id, name, state
+            "--noheader",
         ]
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            jobs = []
-            for line in result.stdout.strip().split("\n"):
-                if line:
-                    parts = line.split(",")
-                    if len(parts) >= 3:
-                        jobs.append({
-                            "job_id": parts[0],
-                            "name": parts[1],
-                            "state": parts[2]
-                        })
-            return jobs
         except subprocess.CalledProcessError:
-            # If no jobs, squeue may return non-zero; treat as empty
+            # If no jobs, squeue may return non-zero; treat as empty.
             return []
+
+        return self._parse_csv_jobs(result.stdout)
 
     def submit_job(self, script_path: Path) -> str:
-        """Submit a job script to SLURM.
-
-        Parameters
-        ----------
-        script_path : Path
-            Path to the job script to submit.
-
-        Returns
-        -------
-        str
-            The SLURM job ID assigned to the submitted job.
-        """
+        """Submit a job script to SLURM and return the assigned job ID."""
         cmd = [self.settings.submit_command, str(script_path)]
-
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
 
-        # Parse job ID from sbatch output: "Submitted batch job 12345"
+        # sbatch output: "Submitted batch job 12345"
         match = re.search(r"Submitted batch job (\d+)", result.stdout)
-        if match:
-            job_id = match.group(1)
-            self.tracked_jobs.add(job_id)
-            return job_id
-        else:
-            raise RuntimeError(f"Failed to parse job ID from sbatch output: {result.stdout}")
+        if not match:
+            raise RuntimeError(
+                f"Failed to parse job ID from sbatch output: {result.stdout!r}"
+            )
+
+        job_id = match.group(1)
+        self.tracked_jobs.add(job_id)
+        return job_id
+
+    def cancel_job(self, job_id: str) -> None:
+        """Cancel a SLURM job via ``scancel``."""
+        cmd = [self.settings.cancel_command, str(job_id)]
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        self.tracked_jobs.discard(str(job_id))
+
+    # ------------------------------------------------------------------
+    # internal helpers
+    # ------------------------------------------------------------------
 
     def _get_running_jobs(self) -> List[Dict[str, str]]:
-        """Get jobs in RUNNING state."""
-        all_jobs = self.get_jobs()
-        return [job for job in all_jobs if job["state"] == "RUNNING"]
+        return [job for job in self.get_jobs() if job["state"] == "RUNNING"]
 
     def _get_pending_jobs(self) -> List[Dict[str, str]]:
-        """Get jobs in PENDING state."""
-        all_jobs = self.get_jobs()
-        return [job for job in all_jobs if job["state"] == "PENDING"]
+        return [job for job in self.get_jobs() if job["state"] == "PENDING"]
 
     def _get_completed_jobs(self) -> List[Dict[str, str]]:
-        """Get jobs in COMPLETED state using sacct."""
-        cmd = [
-            self.settings.accounting_command,
-            "-u", subprocess.check_output(["whoami"]).decode().strip(),
-            "-s", "COMPLETED",
-            "-o", "JobID,JobName,State",
-            "--noheader",
-            "-X"  # Only show main job, not steps
-        ]
-
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            jobs = []
-            for line in result.stdout.strip().split("\n"):
-                if line:
-                    parts = line.split()
-                    if len(parts) >= 3:
-                        jobs.append({
-                            "job_id": parts[0],
-                            "name": parts[1],
-                            "state": parts[2]
-                        })
-            return jobs
-        except subprocess.CalledProcessError:
-            return []
+        return self._sacct_query("COMPLETED")
 
     def _get_failed_jobs(self) -> List[Dict[str, str]]:
-        """Get jobs in FAILED, TIMEOUT, CANCELLED, or other error states."""
+        return self._sacct_query(SLURM_FAILED_STATES)
+
+    def _sacct_query(self, state_filter: str) -> List[Dict[str, str]]:
+        """Run ``sacct`` filtered by ``state_filter`` and parse the output."""
         cmd = [
             self.settings.accounting_command,
-            "-u", subprocess.check_output(["whoami"]).decode().strip(),
-            "-s", "FAILED,TIMEOUT,CANCELLED,NODE_FAIL,PREEMPTED",
-            "-o", "JobID,JobName,State",
+            "-u",
+            _whoami(),
+            "-s",
+            state_filter,
+            "-o",
+            "JobID,JobName,State",
             "--noheader",
-            "-X"  # Only show main job, not steps
+            "-X",  # only show main job, not steps
         ]
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            jobs = []
-            for line in result.stdout.strip().split("\n"):
-                if line:
-                    parts = line.split()
-                    if len(parts) >= 3:
-                        jobs.append({
-                            "job_id": parts[0],
-                            "name": parts[1],
-                            "state": parts[2]
-                        })
-            return jobs
         except subprocess.CalledProcessError:
             return []
 
+        return self._parse_whitespace_jobs(result.stdout)
 
-class SlurmManager(HPCManager):
+    @staticmethod
+    def _parse_csv_jobs(text: str) -> List[Dict[str, str]]:
+        """Parse ``squeue --noheader -o '%i,%j,%T'`` output."""
+        jobs: List[Dict[str, str]] = []
+        for line in text.strip().splitlines():
+            if not line:
+                continue
+            parts = line.split(",")
+            if len(parts) >= 3:
+                jobs.append({"job_id": parts[0], "name": parts[1], "state": parts[2]})
+        return jobs
+
+    @staticmethod
+    def _parse_whitespace_jobs(text: str) -> List[Dict[str, str]]:
+        """Parse ``sacct`` whitespace-delimited output."""
+        jobs: List[Dict[str, str]] = []
+        for line in text.strip().splitlines():
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) >= 3:
+                jobs.append({"job_id": parts[0], "name": parts[1], "state": parts[2]})
+        return jobs
+
+
+class SlurmManager(ScriptTemplateHPCManager):
     """Compute manager for SLURM-based HPC systems.
 
-    This manager autoscales compute services by submitting SLURM batch jobs
-    based on task availability from the alchemiscale server.
+    Autoscales compute services by submitting SLURM batch jobs based on
+    task availability reported by the alchemiscale server.
     """
 
-    def __init__(self, settings: SlurmManagerSettings, service_settings_path: Path):
-        """Initialize SLURM manager.
+    settings: SlurmManagerSettings
+    batch_api: SlurmBatchApi
 
-        Parameters
-        ----------
-        settings : SlurmManagerSettings
-            Settings for the SLURM manager.
-        service_settings_path : Path
-            Path to YAML file containing ComputeServiceSettings for services.
-        """
-        # Initialize parent class (loads settings and template)
-        super().__init__(settings=settings, service_settings_path=service_settings_path)
-
-        # Initialize SLURM batch API
-        self.batch_api = SlurmBatchApi(self.settings)
+    def _create_batch_api(self) -> SlurmBatchApi:
+        return SlurmBatchApi(self.settings)
 
     def _create_job_script(self) -> Path:
-        """Create a job script from template.
+        """Render the SLURM job script template and return its path."""
+        job_name = self._generate_job_name()
 
-        Returns
-        -------
-        Path
-            Path to the created job script file.
-        """
-        # Generate unique job name
-        job_name = f"{self.settings.job_name_prefix}-{uuid4()}"
-
-        # Prepare template substitutions
         substitutions = {
             "JOB_NAME": job_name,
-            "PARTITION": f"#SBATCH --partition={self.settings.partition}" if self.settings.partition else "",
-            "ACCOUNT": f"#SBATCH --account={self.settings.account}" if self.settings.account else "",
-            "QOS": f"#SBATCH --qos={self.settings.qos}" if self.settings.qos else "",
+            "PARTITION": (
+                f"#SBATCH --partition={self.settings.partition}"
+                if self.settings.partition
+                else ""
+            ),
+            "ACCOUNT": (
+                f"#SBATCH --account={self.settings.account}"
+                if self.settings.account
+                else ""
+            ),
+            "QOS": (f"#SBATCH --qos={self.settings.qos}" if self.settings.qos else ""),
             "COMPUTE_MANAGER_ID": str(self.compute_manager_id),
         }
 
-        # Fill in template
-        job_script_content = self.job_script_template
-        for key, value in substitutions.items():
-            job_script_content = job_script_content.replace(f"{{{{ {key} }}}}", value)
-
-        # Write to temporary file
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            suffix=".sh",
-            prefix=f"alchemiscale_{job_name}_",
-            delete=False
-        ) as f:
-            f.write(job_script_content)
-            script_path = Path(f.name)
-
-        return script_path
+        rendered = self._render_template(substitutions)
+        return self._write_job_script(rendered, job_name)

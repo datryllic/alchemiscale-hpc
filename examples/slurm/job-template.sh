@@ -50,13 +50,24 @@ export OPENMM_CPU_THREADS=$SLURM_CPUS_PER_TASK
 # for the compute service (API URL, credentials, scopes, etc.)
 SERVICE_CONFIG="/path/to/compute-service-settings.yaml"
 
-# Start the alchemiscale compute service
+# Start the alchemiscale compute service.
+#
+# `--name "{{ JOB_NAME }}"` overrides the `name` field in the service config so
+# that the registered ComputeServiceID matches the SLURM job name. This is
+# REQUIRED for the manager's `verify_running_jobs` health check to work.
+#
+# `--compute-manager-id "{{ COMPUTE_MANAGER_ID }}"` records the manager that
+# launched this service for provenance.
+#
 # The service will:
 #   1. Register with the compute API
 #   2. Claim and execute tasks
 #   3. Push results back to the API
 #   4. Deregister when done or max time/tasks reached
-alchemiscale compute synchronous -c "$SERVICE_CONFIG"
+alchemiscale compute synchronous \
+    -c "$SERVICE_CONFIG" \
+    --name "{{ JOB_NAME }}" \
+    --compute-manager-id "{{ COMPUTE_MANAGER_ID }}"
 
 # Job completion
 echo "End Time: $(date)"

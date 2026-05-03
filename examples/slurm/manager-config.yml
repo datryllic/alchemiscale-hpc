@@ -9,7 +9,7 @@ name: "my-slurm-manager"
 
 # Path to SLURM job script template (required)
 # The manager will use this template to generate job scripts
-job_script_template: "/path/to/slurm-job-template.sh"
+job_script_template: "/path/to/job-template.sh"
 
 # Maximum number of concurrent compute services (required)
 # The manager will not exceed this number of running jobs
@@ -41,13 +41,28 @@ sleep_interval: 900  # 15 minutes
 # Increase this to scale up faster, but be cautious of overwhelming SLURM
 max_submit_per_cycle: 2
 
-# Cleanup settings
+# In-memory tracking settings
+#
+# These flags control whether the manager removes COMPLETED/failed jobs from
+# its in-memory `tracked_jobs` set each cycle. They do NOT purge SLURM
+# accounting (sacct) records.
 
-# Whether to track and cleanup completed jobs (default: true)
-cleanup_completed_jobs: true
+# Untrack completed jobs each cycle (default: true)
+untrack_completed_jobs: true
 
-# Whether to track and cleanup failed jobs (default: true)
-cleanup_failed_jobs: true
+# Untrack failed jobs when `alchemiscale-hpc slurm cleanup --failed` runs
+# (default: true)
+untrack_failed_jobs: true
+
+# Job script handling
+
+# Directory to write rendered job scripts into. If omitted, the system temp
+# directory is used. The directory will be created if it does not exist.
+# job_script_dir: "/path/to/job-scripts"
+
+# If true, do not delete rendered job scripts after submission. Useful for
+# debugging template substitution. Default: false.
+# keep_job_scripts: false
 
 # Logging settings
 

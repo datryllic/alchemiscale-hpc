@@ -1,247 +1,219 @@
-"""Command-line interface for alchemiscale-hpc."""
+"""Command-line interface for alchemiscale-hpc.
+
+The CLI is generated automatically from the backend registry. Each backend
+that registers itself via :func:`alchemiscale_hpc.base.register_backend`
+gains a ``alchemiscale-hpc <backend> {start,clear-error,show-jobs,cleanup}``
+subcommand group, with no further changes required to this module.
+
+Stub backends (currently LSF and PBS) register a placeholder name without a
+manager class; their CLI groups exist but every subcommand reports that the
+backend is not yet implemented.
+"""
+
+from pathlib import Path
 
 import click
 import yaml
-from pathlib import Path
+
+# Importing the package triggers backend registration.
+from . import base as _base
+
+# Backends present as namespace packages but without an implementation. They
+# get a CLI group with the standard subcommand signatures so that the docs
+# (and any user that copy-pastes a SLURM invocation) work consistently.
+_STUB_BACKENDS = {
+    "lsf": "LSF",
+    "pbs": "PBS/Torque",
+}
+
+
+def _load_settings(config_file: Path, backend: str):
+    _, settings_cls, _ = _base.get_backend(backend)
+    with open(config_file, "r") as f:
+        config = yaml.safe_load(f)
+    return settings_cls(**config)
+
+
+def _build_backend_group(backend: str) -> click.Group:
+    """Build a click group with the standard subcommands for ``backend``."""
+
+    @click.group(
+        name=backend, help=f"Commands for the {backend.upper()} queueing system."
+    )
+    def group() -> None:
+        pass
+
+    config_option = click.option(
+        "-c",
+        "--config-file",
+        "config_file",
+        type=click.Path(exists=True, path_type=Path),
+        required=True,
+        help=f"Path to YAML file containing {backend.upper()}ManagerSettings",
+    )
+    service_option = click.option(
+        "-s",
+        "--service-config-file",
+        "service_config_file",
+        type=click.Path(exists=True, path_type=Path),
+        required=True,
+        help="Path to YAML file containing ComputeServiceSettings",
+    )
+
+    @group.command(name="start", help=f"Start the {backend.upper()} compute manager.")
+    @config_option
+    @service_option
+    def start(config_file: Path, service_config_file: Path) -> None:
+        manager_cls, _, _ = _base.get_backend(backend)
+        settings = _load_settings(config_file, backend)
+        manager = manager_cls(
+            settings=settings, service_settings_path=service_config_file
+        )
+        manager.start()
+
+    @group.command(
+        name="clear-error",
+        help=f"Clear the ERROR status for a {backend.upper()} compute manager.",
+    )
+    @config_option
+    @service_option
+    def clear_error(config_file: Path, service_config_file: Path) -> None:
+        manager_cls, _, _ = _base.get_backend(backend)
+        settings = _load_settings(config_file, backend)
+        manager = manager_cls(
+            settings=settings, service_settings_path=service_config_file
+        )
+        manager.clear_error()
+
+    @group.command(
+        name="show-jobs",
+        help=f"Show all {backend.upper()} jobs in the queue for the current user.",
+    )
+    @config_option
+    def show_jobs(config_file: Path) -> None:
+        _, _, batch_api_cls = _base.get_backend(backend)
+        settings = _load_settings(config_file, backend)
+        batch_api = batch_api_cls(settings)
+
+        jobs = batch_api.get_jobs()
+        if not jobs:
+            click.echo(f"No jobs found in {backend.upper()} queue")
+            return
+
+        click.echo(f"{'Job ID':<12} {'Name':<30} {'State':<15}")
+        click.echo("-" * 57)
+        for job in jobs:
+            click.echo(f"{job['job_id']:<12} {job['name']:<30} {job['state']:<15}")
+
+    @group.command(
+        name="cleanup",
+        help=f"Untrack completed/failed {backend.upper()} jobs.",
+    )
+    @config_option
+    @click.option("--failed", is_flag=True, help="Untrack failed jobs.")
+    @click.option("--completed", is_flag=True, help="Untrack completed jobs.")
+    def cleanup(config_file: Path, failed: bool, completed: bool) -> None:
+        if not failed and not completed:
+            click.echo("Please specify at least one of --failed or --completed")
+            return
+
+        _, _, batch_api_cls = _base.get_backend(backend)
+        settings = _load_settings(config_file, backend)
+        batch_api = batch_api_cls(settings)
+
+        if failed:
+            click.echo("Untracking failed jobs...")
+            batch_api.untrack_failed_jobs()
+            click.echo("Done")
+
+        if completed:
+            click.echo("Untracking completed jobs...")
+            batch_api.untrack_completed_jobs()
+            click.echo("Done")
+
+    return group
+
+
+def _build_stub_group(backend: str, label: str) -> click.Group:
+    """Build a click group that mirrors the standard interface but reports
+    that ``backend`` is not yet implemented.
+
+    The stub subcommands accept and ignore any options/arguments, so
+    invocations like ``alchemiscale-hpc lsf start -c x.yml -s y.yml`` work
+    consistently with the SLURM equivalents.
+    """
+
+    @click.group(
+        name=backend,
+        help=f"Commands for the {label} queueing system (coming soon).",
+    )
+    def group() -> None:
+        pass
+
+    def _make_stub(name: str) -> click.Command:
+        @click.command(
+            name=name,
+            help=f"{name.replace('-', ' ').capitalize()} ({label}, not yet implemented).",
+            context_settings={
+                "ignore_unknown_options": True,
+                "allow_extra_args": True,
+            },
+        )
+        @click.pass_context
+        def stub(ctx: click.Context) -> None:
+            click.echo(f"{label} support is not yet implemented.")
+            click.echo(
+                "Contributions welcome! See alchemiscale_hpc/base.py for the interface."
+            )
+            ctx.exit(1)
+
+        return stub
+
+    for subcommand in ("start", "clear-error", "show-jobs", "cleanup"):
+        group.add_command(_make_stub(subcommand))
+
+    return group
 
 
 @click.group()
-def cli():
+def cli() -> None:
     """alchemiscale-hpc: Tools for using alchemiscale with HPC systems.
 
-    Supports multiple queueing systems: SLURM, LSF, PBS, and more.
+    Each supported queueing system is exposed as a subcommand group, e.g.
 
-    Use system-specific subcommands:
-        - alchemiscale-hpc slurm ...
-        - alchemiscale-hpc lsf ...
-        - alchemiscale-hpc pbs ...
+    \b
+        alchemiscale-hpc slurm start -c manager.yml -s service.yml
+        alchemiscale-hpc slurm show-jobs -c manager.yml
     """
-    pass
 
 
-# ============================================================================
-# SLURM Commands
-# ============================================================================
-
-@cli.group(name="slurm")
-def slurm_group():
-    """Commands for SLURM queueing system."""
-    pass
-
-
-@slurm_group.command(name="start")
-@click.option(
-    "-c",
-    "--config-file",
-    "config_file",
-    type=click.Path(exists=True, path_type=Path),
-    required=True,
-    help="Path to YAML file containing SlurmManagerSettings",
-)
-@click.option(
-    "-s",
-    "--service-config-file",
-    "service_config_file",
-    type=click.Path(exists=True, path_type=Path),
-    required=True,
-    help="Path to YAML file containing ComputeServiceSettings",
-)
-def slurm_start(config_file: Path, service_config_file: Path):
-    """Start the SLURM compute manager.
-
-    The manager will continuously monitor task availability and
-    autoscale compute services by submitting SLURM batch jobs.
-
-    Example:
-
-        alchemiscale-hpc slurm start -c manager-config.yml -s service-config.yml
+def _register_groups() -> None:
+    """Attach a click group for each registered backend, and stubs for known
+    placeholder backends.
     """
-    from .slurm import SlurmManager, SlurmManagerSettings
-
-    # Load manager settings
-    with open(config_file, "r") as f:
-        manager_settings_dict = yaml.safe_load(f)
-
-    manager_settings = SlurmManagerSettings(**manager_settings_dict)
-
-    # Create and start manager
-    manager = SlurmManager(
-        settings=manager_settings,
-        service_settings_path=service_config_file
-    )
-
-    # Start the manager (runs until SIGINT or error)
-    manager.start()
+    registered = set(_base.list_backends())
+    for backend in registered:
+        cli.add_command(_build_backend_group(backend))
+    for backend, label in _STUB_BACKENDS.items():
+        if backend in registered:
+            continue
+        cli.add_command(_build_stub_group(backend, label))
 
 
-@slurm_group.command(name="clear-error")
-@click.option(
-    "-c",
-    "--config-file",
-    "config_file",
-    type=click.Path(exists=True, path_type=Path),
-    required=True,
-    help="Path to YAML file containing SlurmManagerSettings",
-)
-@click.option(
-    "-s",
-    "--service-config-file",
-    "service_config_file",
-    type=click.Path(exists=True, path_type=Path),
-    required=True,
-    help="Path to YAML file containing ComputeServiceSettings",
-)
-def slurm_clear_error(config_file: Path, service_config_file: Path):
-    """Clear error status for a SLURM compute manager.
+# Lazily import known backend packages so they can self-register.
+def _autoload_backends() -> None:
+    import importlib
 
-    Use this if the manager is stuck in ERROR state.
-
-    Example:
-
-        alchemiscale-hpc slurm clear-error -c manager-config.yml -s service-config.yml
-    """
-    from .slurm import SlurmManager, SlurmManagerSettings
-
-    # Load manager settings
-    with open(config_file, "r") as f:
-        manager_settings_dict = yaml.safe_load(f)
-
-    manager_settings = SlurmManagerSettings(**manager_settings_dict)
-
-    # Create manager instance
-    manager = SlurmManager(
-        settings=manager_settings,
-        service_settings_path=service_config_file
-    )
-
-    # Clear error status
-    manager.clear_error()
+    for backend in ("slurm", "lsf", "pbs"):
+        try:
+            importlib.import_module(f"alchemiscale_hpc.{backend}")
+        except ImportError:
+            # A backend might be intentionally absent; skip silently.
+            pass
 
 
-@slurm_group.command(name="show-jobs")
-@click.option(
-    "-c",
-    "--config-file",
-    "config_file",
-    type=click.Path(exists=True, path_type=Path),
-    required=True,
-    help="Path to YAML file containing SlurmManagerSettings",
-)
-def slurm_show_jobs(config_file: Path):
-    """Show all SLURM jobs in the queue.
-
-    Example:
-
-        alchemiscale-hpc slurm show-jobs -c manager-config.yml
-    """
-    from .slurm import SlurmBatchApi, SlurmManagerSettings
-
-    # Load manager settings
-    with open(config_file, "r") as f:
-        manager_settings_dict = yaml.safe_load(f)
-
-    manager_settings = SlurmManagerSettings(**manager_settings_dict)
-
-    # Create batch API
-    batch_api = SlurmBatchApi(manager_settings)
-
-    # Get and display jobs
-    jobs = batch_api.get_jobs()
-
-    if not jobs:
-        click.echo("No jobs found in SLURM queue")
-        return
-
-    click.echo(f"{'Job ID':<12} {'Name':<30} {'State':<15}")
-    click.echo("-" * 57)
-    for job in jobs:
-        click.echo(f"{job['job_id']:<12} {job['name']:<30} {job['state']:<15}")
-
-
-@slurm_group.command(name="cleanup")
-@click.option(
-    "-c",
-    "--config-file",
-    "config_file",
-    type=click.Path(exists=True, path_type=Path),
-    required=True,
-    help="Path to YAML file containing SlurmManagerSettings",
-)
-@click.option(
-    "--failed",
-    is_flag=True,
-    help="Clean up failed jobs from tracking",
-)
-@click.option(
-    "--completed",
-    is_flag=True,
-    help="Clean up completed jobs from tracking",
-)
-def slurm_cleanup(config_file: Path, failed: bool, completed: bool):
-    """Clean up SLURM jobs from tracking.
-
-    Example:
-
-        alchemiscale-hpc slurm cleanup -c manager-config.yml --failed --completed
-    """
-    from .slurm import SlurmBatchApi, SlurmManagerSettings
-
-    if not failed and not completed:
-        click.echo("Please specify at least one of --failed or --completed")
-        return
-
-    # Load manager settings
-    with open(config_file, "r") as f:
-        manager_settings_dict = yaml.safe_load(f)
-
-    manager_settings = SlurmManagerSettings(**manager_settings_dict)
-
-    # Create batch API
-    batch_api = SlurmBatchApi(manager_settings)
-
-    if failed:
-        click.echo("Cleaning up failed jobs...")
-        batch_api.clear_failed_jobs()
-        click.echo("Done")
-
-    if completed:
-        click.echo("Cleaning up completed jobs...")
-        batch_api.clear_successful_jobs()
-        click.echo("Done")
-
-
-# ============================================================================
-# LSF Commands (Future)
-# ============================================================================
-
-@cli.group(name="lsf")
-def lsf_group():
-    """Commands for LSF queueing system (coming soon)."""
-    pass
-
-
-@lsf_group.command(name="start")
-def lsf_start():
-    """Start the LSF compute manager (not yet implemented)."""
-    click.echo("LSF support is not yet implemented.")
-    click.echo("Contributions welcome! See alchemiscale_hpc/base.py for the interface.")
-
-
-# ============================================================================
-# PBS Commands (Future)
-# ============================================================================
-
-@cli.group(name="pbs")
-def pbs_group():
-    """Commands for PBS/Torque queueing system (coming soon)."""
-    pass
-
-
-@pbs_group.command(name="start")
-def pbs_start():
-    """Start the PBS compute manager (not yet implemented)."""
-    click.echo("PBS support is not yet implemented.")
-    click.echo("Contributions welcome! See alchemiscale_hpc/base.py for the interface.")
+_autoload_backends()
+_register_groups()
 
 
 if __name__ == "__main__":

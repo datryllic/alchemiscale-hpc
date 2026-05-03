@@ -2,40 +2,42 @@
 
 from pydantic import Field
 
-from ..base import HPCManagerSettings
+from ..base import ScriptTemplateHPCManagerSettings
 
 
-class SlurmManagerSettings(HPCManagerSettings):
+class SlurmManagerSettings(ScriptTemplateHPCManagerSettings):
     """Settings for the SLURM compute manager.
 
-    Extends HPCManagerSettings with SLURM-specific configuration options.
+    Extends :class:`alchemiscale_hpc.base.ScriptTemplateHPCManagerSettings`
+    with SLURM-specific configuration options.
     """
 
     partition: str | None = Field(
         None,
-        description="SLURM partition to submit jobs to. If None, uses default partition."
+        description=(
+            "SLURM partition to submit jobs to. If None, uses default partition."
+        ),
     )
     account: str | None = Field(
         None,
-        description="SLURM account to charge jobs to. If None, uses default account."
+        description=("SLURM account to charge jobs to. If None, uses default account."),
     )
     qos: str | None = Field(
         None,
-        description="Quality of Service specification for jobs. If None, uses default QOS."
+        description=(
+            "Quality of Service specification for jobs. If None, uses default QOS."
+        ),
     )
     submit_command: str = Field(
-        "sbatch",
-        description="Command to use for submitting SLURM jobs."
+        "sbatch", description="Command to use for submitting SLURM jobs."
     )
     cancel_command: str = Field(
-        "scancel",
-        description="Command to use for canceling SLURM jobs."
+        "scancel", description="Command to use for canceling SLURM jobs."
     )
     query_command: str = Field(
-        "squeue",
-        description="Command to use for querying SLURM job status."
+        "squeue", description="Command to use for querying SLURM job status."
     )
     accounting_command: str = Field(
         "sacct",
-        description="Command to use for querying completed/failed SLURM jobs."
+        description="Command to use for querying completed/failed SLURM jobs.",
     )

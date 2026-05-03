@@ -26,3 +26,6 @@ alchemiscale-hpc = "alchemiscale_hpc.cli:cli"
 
 [project.optional-dependencies]
 test = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
