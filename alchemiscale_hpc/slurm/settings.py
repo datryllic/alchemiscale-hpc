@@ -1,21 +1,16 @@
 """Settings for SLURM-based compute management."""
 
-from pathlib import Path
 from pydantic import Field
-from alchemiscale.compute.settings import ComputeManagerSettings
+
+from ..base import HPCManagerSettings
 
 
-class SlurmManagerSettings(ComputeManagerSettings):
+class SlurmManagerSettings(HPCManagerSettings):
     """Settings for the SLURM compute manager.
 
-    This extends the base ComputeManagerSettings with SLURM-specific
-    configuration options.
+    Extends HPCManagerSettings with SLURM-specific configuration options.
     """
 
-    job_script_template: Path = Field(
-        ...,
-        description="Path to SLURM job script template file."
-    )
     partition: str | None = Field(
         None,
         description="SLURM partition to submit jobs to. If None, uses default partition."
@@ -27,10 +22,6 @@ class SlurmManagerSettings(ComputeManagerSettings):
     qos: str | None = Field(
         None,
         description="Quality of Service specification for jobs. If None, uses default QOS."
-    )
-    job_name_prefix: str = Field(
-        "alchemiscale",
-        description="Prefix for SLURM job names. Full name will be <prefix>-<uuid>."
     )
     submit_command: str = Field(
         "sbatch",
@@ -47,16 +38,4 @@ class SlurmManagerSettings(ComputeManagerSettings):
     accounting_command: str = Field(
         "sacct",
         description="Command to use for querying completed/failed SLURM jobs."
-    )
-    max_submit_per_cycle: int = Field(
-        1,
-        description="Maximum number of jobs to submit in a single cycle."
-    )
-    cleanup_completed_jobs: bool = Field(
-        True,
-        description="If True, track and cleanup completed jobs from accounting system."
-    )
-    cleanup_failed_jobs: bool = Field(
-        True,
-        description="If True, track and cleanup failed jobs from accounting system."
     )

@@ -4,23 +4,32 @@ import click
 import yaml
 from pathlib import Path
 
-from .manager import SlurmManager, SlurmBatchApi
-from .settings import SlurmManagerSettings
-
 
 @click.group()
 def cli():
-    """alchemiscale-hpc: Tools for using alchemiscale with HPC systems."""
+    """alchemiscale-hpc: Tools for using alchemiscale with HPC systems.
+
+    Supports multiple queueing systems: SLURM, LSF, PBS, and more.
+
+    Use system-specific subcommands:
+        - alchemiscale-hpc slurm ...
+        - alchemiscale-hpc lsf ...
+        - alchemiscale-hpc pbs ...
+    """
     pass
 
 
-@cli.group()
-def manager():
-    """Commands for managing SLURM compute managers."""
+# ============================================================================
+# SLURM Commands
+# ============================================================================
+
+@cli.group(name="slurm")
+def slurm_group():
+    """Commands for SLURM queueing system."""
     pass
 
 
-@manager.command(name="start")
+@slurm_group.command(name="start")
 @click.option(
     "-c",
     "--config-file",
@@ -37,7 +46,7 @@ def manager():
     required=True,
     help="Path to YAML file containing ComputeServiceSettings",
 )
-def manager_start(config_file: Path, service_config_file: Path):
+def slurm_start(config_file: Path, service_config_file: Path):
     """Start the SLURM compute manager.
 
     The manager will continuously monitor task availability and
@@ -45,8 +54,10 @@ def manager_start(config_file: Path, service_config_file: Path):
 
     Example:
 
-        alchemiscale-hpc manager start -c manager_config.yml -s service_config.yml
+        alchemiscale-hpc slurm start -c manager-config.yml -s service-config.yml
     """
+    from .slurm import SlurmManager, SlurmManagerSettings
+
     # Load manager settings
     with open(config_file, "r") as f:
         manager_settings_dict = yaml.safe_load(f)
@@ -63,7 +74,7 @@ def manager_start(config_file: Path, service_config_file: Path):
     manager.start()
 
 
-@manager.command(name="clear-error")
+@slurm_group.command(name="clear-error")
 @click.option(
     "-c",
     "--config-file",
@@ -80,15 +91,17 @@ def manager_start(config_file: Path, service_config_file: Path):
     required=True,
     help="Path to YAML file containing ComputeServiceSettings",
 )
-def manager_clear_error(config_file: Path, service_config_file: Path):
-    """Clear error status for a compute manager.
+def slurm_clear_error(config_file: Path, service_config_file: Path):
+    """Clear error status for a SLURM compute manager.
 
     Use this if the manager is stuck in ERROR state.
 
     Example:
 
-        alchemiscale-hpc manager clear-error -c manager_config.yml -s service_config.yml
+        alchemiscale-hpc slurm clear-error -c manager-config.yml -s service-config.yml
     """
+    from .slurm import SlurmManager, SlurmManagerSettings
+
     # Load manager settings
     with open(config_file, "r") as f:
         manager_settings_dict = yaml.safe_load(f)
@@ -105,13 +118,7 @@ def manager_clear_error(config_file: Path, service_config_file: Path):
     manager.clear_error()
 
 
-@cli.group()
-def slurm():
-    """Commands for interacting with SLURM directly."""
-    pass
-
-
-@slurm.command(name="show-jobs")
+@slurm_group.command(name="show-jobs")
 @click.option(
     "-c",
     "--config-file",
@@ -121,12 +128,14 @@ def slurm():
     help="Path to YAML file containing SlurmManagerSettings",
 )
 def slurm_show_jobs(config_file: Path):
-    """Show all tracked SLURM jobs.
+    """Show all SLURM jobs in the queue.
 
     Example:
 
-        alchemiscale-hpc slurm show-jobs -c manager_config.yml
+        alchemiscale-hpc slurm show-jobs -c manager-config.yml
     """
+    from .slurm import SlurmBatchApi, SlurmManagerSettings
+
     # Load manager settings
     with open(config_file, "r") as f:
         manager_settings_dict = yaml.safe_load(f)
@@ -149,7 +158,7 @@ def slurm_show_jobs(config_file: Path):
         click.echo(f"{job['job_id']:<12} {job['name']:<30} {job['state']:<15}")
 
 
-@slurm.command(name="cleanup")
+@slurm_group.command(name="cleanup")
 @click.option(
     "-c",
     "--config-file",
@@ -173,8 +182,10 @@ def slurm_cleanup(config_file: Path, failed: bool, completed: bool):
 
     Example:
 
-        alchemiscale-hpc slurm cleanup -c manager_config.yml --failed --completed
+        alchemiscale-hpc slurm cleanup -c manager-config.yml --failed --completed
     """
+    from .slurm import SlurmBatchApi, SlurmManagerSettings
+
     if not failed and not completed:
         click.echo("Please specify at least one of --failed or --completed")
         return
@@ -197,6 +208,40 @@ def slurm_cleanup(config_file: Path, failed: bool, completed: bool):
         click.echo("Cleaning up completed jobs...")
         batch_api.clear_successful_jobs()
         click.echo("Done")
+
+
+# ============================================================================
+# LSF Commands (Future)
+# ============================================================================
+
+@cli.group(name="lsf")
+def lsf_group():
+    """Commands for LSF queueing system (coming soon)."""
+    pass
+
+
+@lsf_group.command(name="start")
+def lsf_start():
+    """Start the LSF compute manager (not yet implemented)."""
+    click.echo("LSF support is not yet implemented.")
+    click.echo("Contributions welcome! See alchemiscale_hpc/base.py for the interface.")
+
+
+# ============================================================================
+# PBS Commands (Future)
+# ============================================================================
+
+@cli.group(name="pbs")
+def pbs_group():
+    """Commands for PBS/Torque queueing system (coming soon)."""
+    pass
+
+
+@pbs_group.command(name="start")
+def pbs_start():
+    """Start the PBS compute manager (not yet implemented)."""
+    click.echo("PBS support is not yet implemented.")
+    click.echo("Contributions welcome! See alchemiscale_hpc/base.py for the interface.")
 
 
 if __name__ == "__main__":

@@ -6,24 +6,12 @@ import re
 from pathlib import Path
 from uuid import uuid4
 from typing import Set, List, Dict
-import yaml
 
-from alchemiscale.compute.manager import ComputeManager
-
+from ..base import HPCManager, HPCBatchApi, JobNotFoundError, JobFailureError
 from .settings import SlurmManagerSettings
 
 
-class JobNotFoundError(Exception):
-    """Raised when a job is not found in SLURM queue."""
-    pass
-
-
-class JobFailureError(Exception):
-    """Raised when a SLURM job has failed."""
-    pass
-
-
-class SlurmBatchApi:
+class SlurmBatchApi(HPCBatchApi):
     """Helper class for interacting with SLURM batch system."""
 
     def __init__(self, settings: SlurmManagerSettings):
@@ -34,8 +22,8 @@ class SlurmBatchApi:
         settings : SlurmManagerSettings
             Settings for the SLURM manager.
         """
-        self.settings = settings
-        self.tracked_jobs: Set[str] = set()  # Track job IDs we've submitted
+        super().__init__(settings)
+        self.settings: SlurmManagerSettings = settings
 
     def check_job_health(self):
         """Check if any tracked jobs have failed.
@@ -134,7 +122,7 @@ class SlurmBatchApi:
                             "state": parts[2]
                         })
             return jobs
-        except subprocess.CalledProcessError as e:
+        except subprocess.CalledProcessError:
             # If no jobs, squeue may return non-zero; treat as empty
             return []
 
@@ -229,7 +217,7 @@ class SlurmBatchApi:
             return []
 
 
-class SlurmManager(ComputeManager):
+class SlurmManager(HPCManager):
     """Compute manager for SLURM-based HPC systems.
 
     This manager autoscales compute services by submitting SLURM batch jobs
@@ -246,67 +234,11 @@ class SlurmManager(ComputeManager):
         service_settings_path : Path
             Path to YAML file containing ComputeServiceSettings for services.
         """
-        # Load service settings
-        with open(service_settings_path, "r") as f:
-            service_settings_dict = yaml.safe_load(f)
-
-        # Initialize parent class
-        super().__init__(settings=settings, service_settings=service_settings_dict)
+        # Initialize parent class (loads settings and template)
+        super().__init__(settings=settings, service_settings_path=service_settings_path)
 
         # Initialize SLURM batch API
         self.batch_api = SlurmBatchApi(self.settings)
-
-        # Load job script template
-        with open(self.settings.job_script_template, "r") as f:
-            self.job_script_template = f.read()
-
-    def create_compute_services(self, data: dict) -> int:
-        """Create compute services by submitting SLURM jobs.
-
-        This method is called by the base class when scaling up is needed.
-
-        Parameters
-        ----------
-        data : dict
-            Data from server instruction containing:
-            - compute_service_ids: list of currently active service IDs
-            - num_tasks: number of waiting tasks
-
-        Returns
-        -------
-        int
-            Number of new compute services created.
-        """
-        compute_service_ids = data["compute_service_ids"]
-        # Extract job names from service IDs (format: jobname-uuid)
-        server_job_names = {csid.split("-")[0] for csid in compute_service_ids}
-
-        self.logger.info("Checking health of SLURM jobs")
-        self.batch_api.check_job_health()
-
-        self.logger.info("Verifying running jobs are registered with server")
-        self.batch_api.verify_running_jobs(server_job_names)
-
-        self.logger.info("Cleaning up completed jobs")
-        self.batch_api.clear_successful_jobs()
-
-        # Only submit if no jobs are pending
-        if not self.batch_api.jobs_pending():
-            # Submit up to max_submit_per_cycle jobs
-            num_submitted = 0
-            for _ in range(self.settings.max_submit_per_cycle):
-                job_script_path = self._create_job_script()
-                try:
-                    job_id = self.batch_api.submit_job(job_script_path)
-                    self.logger.info(f"Submitted SLURM job {job_id}")
-                    num_submitted += 1
-                except Exception as e:
-                    self.logger.error(f"Failed to submit job: {e}")
-                    break
-            return num_submitted
-        else:
-            self.logger.info("Skipping job creation, pending jobs exist")
-            return 0
 
     def _create_job_script(self) -> Path:
         """Create a job script from template.
