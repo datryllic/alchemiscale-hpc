@@ -116,24 +116,26 @@ alchemiscale-hpc slurm clear-error \
     -s my-service-config.yml
 ```
 
-### Untrack Jobs
+### Cleanup Jobs
 
-Remove failed jobs from the manager's in-memory tracking set:
+Clear failed jobs from the manager's in-memory tracking set:
 
 ```bash
 alchemiscale-hpc slurm cleanup -c my-manager-config.yml --failed
 ```
 
-Remove completed jobs from tracking:
+Clear successful jobs from tracking:
 
 ```bash
-alchemiscale-hpc slurm cleanup -c my-manager-config.yml --completed
+alchemiscale-hpc slurm cleanup -c my-manager-config.yml --successful
 ```
 
-Note: `cleanup` only updates the manager's in-memory tracking. It does not
-purge SLURM accounting (`sacct`) records or delete job scripts. To prevent
-job scripts from being removed automatically after submission (useful for
-debugging), set `keep_job_scripts: true` in the manager config.
+Note: for SLURM, `cleanup` only updates the manager's in-memory tracking. It
+does not purge SLURM accounting (`sacct`) records or delete job scripts. (The
+same `cleanup` command on a Kubernetes-style backend would actually delete
+the corresponding Job objects.) To prevent job scripts from being removed
+automatically after submission (useful for debugging), set
+`keep_job_scripts: true` in the manager config.
 
 ## How It Works
 

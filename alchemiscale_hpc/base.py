@@ -131,18 +131,20 @@ class ScriptTemplateHPCManagerSettings(HPCManagerSettings):
             "Useful for debugging. Default False."
         ),
     )
-    untrack_completed_jobs: bool = Field(
+    cleanup_successful_jobs: bool = Field(
         True,
         description=(
-            "If True, remove completed jobs from the manager's in-memory "
-            "tracking set each cycle."
+            "If True, the per-cycle ``clear_successful_jobs`` step is enabled. "
+            "Backends interpret this differently: the SLURM backend drops "
+            "completed jobs from its in-memory tracking set; the (future) "
+            "Kubernetes-style backends actually delete completed Job objects."
         ),
     )
-    untrack_failed_jobs: bool = Field(
+    cleanup_failed_jobs: bool = Field(
         True,
         description=(
-            "If True, remove failed jobs from the manager's in-memory "
-            "tracking set when explicitly cleaned up."
+            "If True, ``clear_failed_jobs`` is enabled. Same backend-specific "
+            "semantics as ``cleanup_successful_jobs``."
         ),
     )
 
@@ -185,12 +187,25 @@ class HPCBatchApi(ABC):
         """
 
     @abstractmethod
-    def untrack_completed_jobs(self) -> None:
-        """Drop completed jobs from the in-memory tracking set."""
+    def clear_successful_jobs(self) -> None:
+        """Per-cycle cleanup hook for jobs that completed successfully.
+
+        The exact action is backend-defined. For SLURM-style backends this is
+        an in-memory operation (drop the IDs from ``tracked_jobs``); for
+        Kubernetes-style backends this should actually delete the Job
+        objects from the batch system. Either way, this is called
+        unconditionally in :meth:`ScriptTemplateHPCManager.create_compute_services`
+        once per cycle, gated only by the ``cleanup_successful_jobs`` setting.
+        """
 
     @abstractmethod
-    def untrack_failed_jobs(self) -> None:
-        """Drop failed jobs from the in-memory tracking set."""
+    def clear_failed_jobs(self) -> None:
+        """Operator-driven cleanup hook for failed jobs.
+
+        Mirrors :meth:`clear_successful_jobs` but for failed jobs. Not called
+        on every cycle; reached via the ``alchemiscale-hpc <backend> cleanup
+        --failed`` CLI command after an operator has investigated a failure.
+        """
 
     @abstractmethod
     def jobs_pending(self) -> bool:
@@ -209,10 +224,6 @@ class HPCBatchApi(ABC):
     @abstractmethod
     def submit_job(self, script_path: Path) -> str:
         """Submit ``script_path`` to the batch system and return the job ID."""
-
-    @abstractmethod
-    def cancel_job(self, job_id: str) -> None:
-        """Cancel the job identified by ``job_id``."""
 
 
 class HPCManager(ComputeManager, ABC):
@@ -263,7 +274,8 @@ class ScriptTemplateHPCManager(HPCManager):
 
     1. Health-check tracked jobs.
     2. Verify running jobs are registered with the server.
-    3. Untrack completed jobs.
+    3. Clear successful jobs (semantics are backend-specific; see
+       :meth:`HPCBatchApi.clear_successful_jobs`).
     4. If no jobs are pending, submit up to ``max_submit_per_cycle`` new jobs.
 
     Subclasses only need to implement :meth:`_create_job_script`, which renders
@@ -312,8 +324,8 @@ class ScriptTemplateHPCManager(HPCManager):
         self.logger.info("Verifying running jobs are registered with server")
         self.batch_api.verify_running_jobs(server_job_names)
 
-        self.logger.info("Untracking completed jobs")
-        self.batch_api.untrack_completed_jobs()
+        self.logger.info("Clearing successful jobs")
+        self.batch_api.clear_successful_jobs()
 
         if self.batch_api.jobs_pending():
             self.logger.info("Skipping job creation, pending jobs exist")

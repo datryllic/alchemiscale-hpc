@@ -117,7 +117,8 @@ The package uses a modular architecture with two abstraction layers:
    - `HPCManager`: minimal manager contract (`_create_batch_api`,
      `create_compute_services`). Extends alchemiscale's `ComputeManager`.
    - `HPCBatchApi`: abstract interface for batch system commands
-     (`submit_job`, `cancel_job`, `get_jobs`, `check_job_health`, etc.).
+     (`submit_job`, `get_jobs`, `check_job_health`,
+     `clear_successful_jobs`, `clear_failed_jobs`, ...).
    - `HPCManagerSettings`: settings every backend needs (`name`,
      `job_name_prefix`, `max_submit_per_cycle`, ...).
 
@@ -128,7 +129,7 @@ The package uses a modular architecture with two abstraction layers:
      Subclasses only implement `_create_batch_api` and `_create_job_script`.
    - `ScriptTemplateHPCManagerSettings(HPCManagerSettings)`: adds
      `job_script_template`, `job_script_dir`, `keep_job_scripts`,
-     `untrack_completed_jobs`, `untrack_failed_jobs`.
+     `cleanup_successful_jobs`, `cleanup_failed_jobs`.
 
 3. **Backend registry**: each backend self-registers via
    `register_backend(name, Manager, Settings, BatchApi)` in its package
@@ -137,8 +138,8 @@ The package uses a modular architecture with two abstraction layers:
 
 4. **System-specific implementations**: each queueing system has its own
    subpackage (`alchemiscale_hpc/<system>/`), wraps system commands
-   (sbatch/bsub/qsub, squeue/bjobs/qstat, scancel/bkill/qdel, ...), and
-   provides a job-script template for users to copy and customize.
+   (sbatch/bsub/qsub, squeue/bjobs/qstat, ...), and provides a job-script
+   template for users to copy and customize.
 
 5. **Common autoscaling logic** is inherited from alchemiscale's
    `ComputeManager`: request instructions from the server, scale based on

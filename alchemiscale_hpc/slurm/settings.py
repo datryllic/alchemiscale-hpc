@@ -31,9 +31,6 @@ class SlurmManagerSettings(ScriptTemplateHPCManagerSettings):
     submit_command: str = Field(
         "sbatch", description="Command to use for submitting SLURM jobs."
     )
-    cancel_command: str = Field(
-        "scancel", description="Command to use for canceling SLURM jobs."
-    )
     query_command: str = Field(
         "squeue", description="Command to use for querying SLURM job status."
     )

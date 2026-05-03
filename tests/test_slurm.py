@@ -51,8 +51,8 @@ def test_slurm_settings_extends_script_template_base():
     # Inherited from ScriptTemplateHPCManagerSettings:
     assert {
         "job_script_template",
-        "untrack_completed_jobs",
-        "untrack_failed_jobs",
+        "cleanup_successful_jobs",
+        "cleanup_failed_jobs",
         "keep_job_scripts",
         "job_script_dir",
     } <= fields
@@ -62,10 +62,11 @@ def test_slurm_settings_extends_script_template_base():
         "account",
         "qos",
         "submit_command",
-        "cancel_command",
         "query_command",
         "accounting_command",
     } <= fields
+    # cancel_command was removed when cancel_job left the interface.
+    assert "cancel_command" not in fields
 
 
 def test_parse_csv_jobs_handles_empty():
@@ -179,7 +180,7 @@ def test_jobs_pending_only_counts_tracked(slurm_settings: SlurmManagerSettings):
         assert api.jobs_pending() is True
 
 
-def test_untrack_completed_jobs_removes_from_set(
+def test_clear_successful_jobs_removes_from_set(
     slurm_settings: SlurmManagerSettings,
 ):
     api = SlurmBatchApi(slurm_settings)
@@ -192,11 +193,27 @@ def test_untrack_completed_jobs_removes_from_set(
             {"job_id": "2", "name": "y", "state": "COMPLETED"},
         ],
     ):
-        api.untrack_completed_jobs()
+        api.clear_successful_jobs()
     assert api.tracked_jobs == {"3"}
 
 
-def test_untrack_completed_jobs_respects_setting(tmp_path: Path):
+def test_clear_failed_jobs_removes_from_set(
+    slurm_settings: SlurmManagerSettings,
+):
+    api = SlurmBatchApi(slurm_settings)
+    api.tracked_jobs.update({"1", "2", "3"})
+    with patch.object(
+        api,
+        "_get_failed_jobs",
+        return_value=[
+            {"job_id": "1", "name": "x", "state": "FAILED"},
+        ],
+    ):
+        api.clear_failed_jobs()
+    assert api.tracked_jobs == {"2", "3"}
+
+
+def test_clear_successful_jobs_respects_setting(tmp_path: Path):
     template = tmp_path / "job-template.sh"
     template.write_text("#!/bin/bash\n#SBATCH --job-name={{ JOB_NAME }}\n")
     settings = SlurmManagerSettings(
@@ -204,7 +221,7 @@ def test_untrack_completed_jobs_respects_setting(tmp_path: Path):
         logfile=None,
         max_compute_services=2,
         job_script_template=template,
-        untrack_completed_jobs=False,
+        cleanup_successful_jobs=False,
     )
     api = SlurmBatchApi(settings)
     api.tracked_jobs.add("1")
@@ -213,7 +230,7 @@ def test_untrack_completed_jobs_respects_setting(tmp_path: Path):
         "_get_completed_jobs",
         return_value=[{"job_id": "1", "name": "x", "state": "COMPLETED"}],
     ):
-        api.untrack_completed_jobs()
+        api.clear_successful_jobs()
     # Setting disabled -> nothing removed
     assert api.tracked_jobs == {"1"}
 
@@ -247,26 +264,13 @@ def test_submit_job_raises_on_unparseable_output(
             api.submit_job(script)
 
 
-def test_cancel_job_calls_scancel_and_untracks(
-    slurm_settings: SlurmManagerSettings,
-):
+def test_no_cancel_job_method(slurm_settings: SlurmManagerSettings):
+    """Regression: cancel_job was dropped because no caller (framework or
+    CLI) ever uses it. The k8s reference implementation likewise has no
+    per-job cancel — only bulk clear_failed_jobs / clear_successful_jobs.
+    """
     api = SlurmBatchApi(slurm_settings)
-    api.tracked_jobs.add("12345")
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = type(
-            "R", (), {"stdout": "", "stderr": "", "returncode": 0}
-        )
-        api.cancel_job("12345")
-    assert mock_run.call_args[0][0] == [
-        slurm_settings.cancel_command,
-        "12345",
-    ]
-    assert "12345" not in api.tracked_jobs
-
-
-def test_cancel_command_is_in_settings(slurm_settings: SlurmManagerSettings):
-    """Regression check: cancel_command must be exposed and used."""
-    assert slurm_settings.cancel_command == "scancel"
+    assert not hasattr(api, "cancel_job")
 
 
 def _build_manager(
@@ -331,7 +335,7 @@ def test_slurm_manager_create_compute_services_cleans_up_scripts(
 
     with patch.object(mgr.batch_api, "check_job_health"), patch.object(
         mgr.batch_api, "verify_running_jobs"
-    ), patch.object(mgr.batch_api, "untrack_completed_jobs"), patch.object(
+    ), patch.object(mgr.batch_api, "clear_successful_jobs"), patch.object(
         mgr.batch_api, "jobs_pending", return_value=False
     ), patch.object(
         mgr.batch_api, "submit_job", side_effect=_fake_submit
@@ -359,7 +363,7 @@ def test_slurm_manager_keep_job_scripts(
 
     with patch.object(mgr.batch_api, "check_job_health"), patch.object(
         mgr.batch_api, "verify_running_jobs"
-    ), patch.object(mgr.batch_api, "untrack_completed_jobs"), patch.object(
+    ), patch.object(mgr.batch_api, "clear_successful_jobs"), patch.object(
         mgr.batch_api, "jobs_pending", return_value=False
     ), patch.object(
         mgr.batch_api, "submit_job", side_effect=_fake_submit
@@ -376,7 +380,7 @@ def test_create_compute_services_skips_when_pending(
     mgr = _build_manager(slurm_settings, tmp_path)
     with patch.object(mgr.batch_api, "check_job_health"), patch.object(
         mgr.batch_api, "verify_running_jobs"
-    ), patch.object(mgr.batch_api, "untrack_completed_jobs"), patch.object(
+    ), patch.object(mgr.batch_api, "clear_successful_jobs"), patch.object(
         mgr.batch_api, "jobs_pending", return_value=True
     ), patch.object(
         mgr.batch_api, "submit_job"
@@ -408,7 +412,7 @@ def test_create_compute_services_strips_uuid_suffix_correctly(
 
     with patch.object(mgr.batch_api, "check_job_health"), patch.object(
         mgr.batch_api, "verify_running_jobs", side_effect=_capture
-    ), patch.object(mgr.batch_api, "untrack_completed_jobs"), patch.object(
+    ), patch.object(mgr.batch_api, "clear_successful_jobs"), patch.object(
         mgr.batch_api, "jobs_pending", return_value=True
     ):
         mgr.create_compute_services(

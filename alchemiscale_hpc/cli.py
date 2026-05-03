@@ -107,14 +107,20 @@ def _build_backend_group(backend: str) -> click.Group:
 
     @group.command(
         name="cleanup",
-        help=f"Untrack completed/failed {backend.upper()} jobs.",
+        help=f"Clear successful and/or failed {backend.upper()} jobs.",
     )
     @config_option
-    @click.option("--failed", is_flag=True, help="Untrack failed jobs.")
-    @click.option("--completed", is_flag=True, help="Untrack completed jobs.")
-    def cleanup(config_file: Path, failed: bool, completed: bool) -> None:
-        if not failed and not completed:
-            click.echo("Please specify at least one of --failed or --completed")
+    @click.option("--failed", is_flag=True, help="Clear failed jobs.")
+    @click.option(
+        "--successful",
+        "--completed",
+        "successful",
+        is_flag=True,
+        help="Clear successful jobs.",
+    )
+    def cleanup(config_file: Path, failed: bool, successful: bool) -> None:
+        if not failed and not successful:
+            click.echo("Please specify at least one of --failed or --successful")
             return
 
         _, _, batch_api_cls = _base.get_backend(backend)
@@ -122,13 +128,13 @@ def _build_backend_group(backend: str) -> click.Group:
         batch_api = batch_api_cls(settings)
 
         if failed:
-            click.echo("Untracking failed jobs...")
-            batch_api.untrack_failed_jobs()
+            click.echo("Clearing failed jobs...")
+            batch_api.clear_failed_jobs()
             click.echo("Done")
 
-        if completed:
-            click.echo("Untracking completed jobs...")
-            batch_api.untrack_completed_jobs()
+        if successful:
+            click.echo("Clearing successful jobs...")
+            batch_api.clear_successful_jobs()
             click.echo("Done")
 
     return group

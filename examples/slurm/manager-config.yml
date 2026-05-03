@@ -41,18 +41,20 @@ sleep_interval: 900  # 15 minutes
 # Increase this to scale up faster, but be cautious of overwhelming SLURM
 max_submit_per_cycle: 2
 
-# In-memory tracking settings
+# Cleanup settings
 #
-# These flags control whether the manager removes COMPLETED/failed jobs from
-# its in-memory `tracked_jobs` set each cycle. They do NOT purge SLURM
-# accounting (sacct) records.
+# For SLURM, "cleanup" means removing job IDs from the manager's in-memory
+# tracking set. SLURM accounting (sacct) records are immutable history and
+# are not modified by these flags. (Other backends — e.g. Kubernetes — can
+# interpret these flags as actually deleting Job objects from the batch
+# system.)
 
-# Untrack completed jobs each cycle (default: true)
-untrack_completed_jobs: true
+# Run the per-cycle clear_successful_jobs step (default: true).
+cleanup_successful_jobs: true
 
-# Untrack failed jobs when `alchemiscale-hpc slurm cleanup --failed` runs
-# (default: true)
-untrack_failed_jobs: true
+# Run clear_failed_jobs when `alchemiscale-hpc slurm cleanup --failed` is
+# invoked (default: true).
+cleanup_failed_jobs: true
 
 # Job script handling
 
@@ -79,9 +81,6 @@ logfile: "/path/to/logs/manager.log"
 
 # Command to submit jobs (default: "sbatch")
 # submit_command: "sbatch"
-
-# Command to cancel jobs (default: "scancel")
-# cancel_command: "scancel"
 
 # Command to query job queue (default: "squeue")
 # query_command: "squeue"

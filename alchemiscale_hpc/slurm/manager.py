@@ -80,16 +80,25 @@ class SlurmBatchApi(HPCBatchApi):
                     "`alchemiscale compute synchronous`."
                 )
 
-    def untrack_completed_jobs(self) -> None:
-        """Remove completed jobs from the in-memory tracking set."""
-        if not self.settings.untrack_completed_jobs:
+    def clear_successful_jobs(self) -> None:
+        """Drop completed jobs from the in-memory tracking set.
+
+        SLURM ``sacct`` records are immutable history, so there is nothing to
+        delete on the cluster side; the manager simply forgets about jobs it
+        no longer needs to monitor.
+        """
+        if not self.settings.cleanup_successful_jobs:
             return
         for job in self._get_completed_jobs():
             self.tracked_jobs.discard(job["job_id"])
 
-    def untrack_failed_jobs(self) -> None:
-        """Remove failed jobs from the in-memory tracking set."""
-        if not self.settings.untrack_failed_jobs:
+    def clear_failed_jobs(self) -> None:
+        """Drop failed jobs from the in-memory tracking set.
+
+        Same caveat as :meth:`clear_successful_jobs`: this is purely
+        in-memory; ``sacct`` records are not modified.
+        """
+        if not self.settings.cleanup_failed_jobs:
             return
         for job in self._get_failed_jobs():
             self.tracked_jobs.discard(job["job_id"])
@@ -133,12 +142,6 @@ class SlurmBatchApi(HPCBatchApi):
         job_id = match.group(1)
         self.tracked_jobs.add(job_id)
         return job_id
-
-    def cancel_job(self, job_id: str) -> None:
-        """Cancel a SLURM job via ``scancel``."""
-        cmd = [self.settings.cancel_command, str(job_id)]
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
-        self.tracked_jobs.discard(str(job_id))
 
     # ------------------------------------------------------------------
     # internal helpers
