@@ -1,5 +1,6 @@
 """Tests for the SLURM batch API and manager."""
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -32,6 +33,16 @@ def slurm_settings(tmp_path: Path) -> SlurmManagerSettings:
         job_script_template=template,
         partition="testpart",
         account="testacct",
+        # Tests assume jobs are immediately past grace; override the default.
+        job_registration_grace_period=0,
+    )
+
+
+def _track(api: SlurmBatchApi, job_id: str, age_seconds: float = 9999) -> None:
+    """Track ``job_id`` and back-date its submission so it's past grace."""
+    api._track(job_id)
+    api._submission_times[job_id] = datetime.now(tz=timezone.utc) - timedelta(
+        seconds=age_seconds
     )
 
 
@@ -41,6 +52,7 @@ def test_slurm_batch_api_is_concrete(slurm_settings: SlurmManagerSettings):
     assert isinstance(api, HPCBatchApi)
     # tracked_jobs initialized empty
     assert api.tracked_jobs == set()
+    assert api._submission_times == {}
 
 
 def test_slurm_settings_extends_script_template_base():
@@ -55,6 +67,7 @@ def test_slurm_settings_extends_script_template_base():
         "cleanup_failed_jobs",
         "keep_job_scripts",
         "job_script_dir",
+        "job_registration_grace_period",
     } <= fields
     # SLURM-specific:
     assert {
@@ -69,34 +82,47 @@ def test_slurm_settings_extends_script_template_base():
     assert "cancel_command" not in fields
 
 
-def test_parse_csv_jobs_handles_empty():
-    assert SlurmBatchApi._parse_csv_jobs("") == []
-    assert SlurmBatchApi._parse_csv_jobs("\n\n") == []
+def test_parse_jobs_handles_empty():
+    assert SlurmBatchApi._parse_jobs("") == []
+    assert SlurmBatchApi._parse_jobs("\n\n") == []
 
 
-def test_parse_csv_jobs_parses_squeue_output():
-    out = "12345,alchemiscale-abcd,RUNNING\n67890,otherjob,PENDING\n"
-    parsed = SlurmBatchApi._parse_csv_jobs(out)
+def test_parse_jobs_parses_pipe_output():
+    out = "12345|RUNNING|alchemiscale-abcd\n67890|PENDING|otherjob\n"
+    parsed = SlurmBatchApi._parse_jobs(out)
     assert parsed == [
-        {"job_id": "12345", "name": "alchemiscale-abcd", "state": "RUNNING"},
-        {"job_id": "67890", "name": "otherjob", "state": "PENDING"},
+        {"job_id": "12345", "state": "RUNNING", "name": "alchemiscale-abcd"},
+        {"job_id": "67890", "state": "PENDING", "name": "otherjob"},
     ]
 
 
-def test_parse_whitespace_jobs_parses_sacct_output():
-    out = "12345 myjob COMPLETED\n67890 other FAILED\n"
-    parsed = SlurmBatchApi._parse_whitespace_jobs(out)
+def test_parse_jobs_preserves_separators_in_job_name():
+    """Job name is the last column; embedded ``|`` (or commas, spaces) survive.
+
+    This guards against the previous CSV implementation, where a comma in a
+    user-supplied job name would silently corrupt parsing.
+    """
+    out = "12345|RUNNING|weird,name|with|pipes and spaces\n"
+    parsed = SlurmBatchApi._parse_jobs(out)
     assert parsed == [
-        {"job_id": "12345", "name": "myjob", "state": "COMPLETED"},
-        {"job_id": "67890", "name": "other", "state": "FAILED"},
+        {
+            "job_id": "12345",
+            "state": "RUNNING",
+            "name": "weird,name|with|pipes and spaces",
+        }
     ]
 
 
-def test_check_job_health_raises_on_tracked_failure(
-    slurm_settings: SlurmManagerSettings,
-):
+# ----------------------------------------------------------------------
+# check_job_health
+# ----------------------------------------------------------------------
+
+
+def test_check_job_health_raises_on_failure(slurm_settings: SlurmManagerSettings):
+    """``_get_failed_jobs`` is already scoped to tracked jobs, so any
+    returned entry is a real failure to surface."""
     api = SlurmBatchApi(slurm_settings)
-    api.tracked_jobs.add("12345")
+    _track(api, "12345")
     with patch.object(
         api,
         "_get_failed_jobs",
@@ -106,25 +132,26 @@ def test_check_job_health_raises_on_tracked_failure(
             api.check_job_health()
 
 
-def test_check_job_health_ignores_untracked_failures(
+def test_check_job_health_silent_when_no_failures(
     slurm_settings: SlurmManagerSettings,
 ):
     api = SlurmBatchApi(slurm_settings)
-    api.tracked_jobs.add("99999")
-    with patch.object(
-        api,
-        "_get_failed_jobs",
-        return_value=[{"job_id": "12345", "name": "x", "state": "FAILED"}],
-    ):
-        # No tracked job has failed; should be silent.
+    _track(api, "12345")
+    with patch.object(api, "_get_failed_jobs", return_value=[]):
         api.check_job_health()
+
+
+# ----------------------------------------------------------------------
+# verify_running_jobs
+# ----------------------------------------------------------------------
 
 
 def test_verify_running_jobs_recognizes_registered(
     slurm_settings: SlurmManagerSettings,
 ):
-    """A SLURM job whose name matches a server-known service name passes."""
+    """A tracked SLURM job whose name matches a server-known service passes."""
     api = SlurmBatchApi(slurm_settings)
+    _track(api, "1")
     job_name = f"{slurm_settings.job_name_prefix}-deadbeef"
     with patch.object(
         api,
@@ -137,8 +164,9 @@ def test_verify_running_jobs_recognizes_registered(
 def test_verify_running_jobs_raises_on_unregistered(
     slurm_settings: SlurmManagerSettings,
 ):
-    """A SLURM job whose name is *not* in server_job_names triggers the error."""
+    """A tracked, past-grace, running job not in server_job_names triggers."""
     api = SlurmBatchApi(slurm_settings)
+    _track(api, "1")
     job_name = f"{slurm_settings.job_name_prefix}-deadbeef"
     with patch.object(
         api,
@@ -149,28 +177,78 @@ def test_verify_running_jobs_raises_on_unregistered(
             api.verify_running_jobs(set())
 
 
-def test_verify_running_jobs_skips_non_managed_jobs(
+def test_verify_running_jobs_ignores_untracked_jobs(
     slurm_settings: SlurmManagerSettings,
 ):
-    """Jobs without our prefix are ignored entirely."""
+    """Jobs we did not submit are ignored, even if they share our prefix.
+
+    Regression: the previous implementation filtered by prefix only, which
+    meant a second manager (or a stray user job) with the same prefix would
+    trip the check.
+    """
     api = SlurmBatchApi(slurm_settings)
+    # tracked_jobs intentionally empty
     with patch.object(
         api,
         "_get_running_jobs",
-        return_value=[{"job_id": "1", "name": "someone-elses-job", "state": "RUNNING"}],
+        return_value=[
+            {
+                "job_id": "1",
+                "name": f"{slurm_settings.job_name_prefix}-from-other-manager",
+                "state": "RUNNING",
+            }
+        ],
     ):
+        api.verify_running_jobs(set())  # should NOT raise
+
+
+def test_verify_running_jobs_grace_period_skips_young_jobs(
+    slurm_settings: SlurmManagerSettings,
+):
+    """Jobs younger than the grace period are skipped, even when unregistered."""
+    settings = slurm_settings.model_copy(update={"job_registration_grace_period": 600})
+    api = SlurmBatchApi(settings)
+    # Track with age=10s; well inside the 600s grace window.
+    _track(api, "1", age_seconds=10)
+    job_name = f"{settings.job_name_prefix}-young"
+    with patch.object(
+        api,
+        "_get_running_jobs",
+        return_value=[{"job_id": "1", "name": job_name, "state": "RUNNING"}],
+    ):
+        # Empty server_job_names; without the grace period this would raise.
         api.verify_running_jobs(set())
 
 
-def test_jobs_pending_only_counts_tracked(slurm_settings: SlurmManagerSettings):
-    api = SlurmBatchApi(slurm_settings)
-    api.tracked_jobs.add("12345")
+def test_verify_running_jobs_grace_period_expires(
+    slurm_settings: SlurmManagerSettings,
+):
+    """Past the grace period, the same job DOES raise."""
+    settings = slurm_settings.model_copy(update={"job_registration_grace_period": 60})
+    api = SlurmBatchApi(settings)
+    _track(api, "1", age_seconds=120)
+    job_name = f"{settings.job_name_prefix}-old"
     with patch.object(
         api,
-        "_get_pending_jobs",
-        return_value=[{"job_id": "67890", "name": "x", "state": "PENDING"}],
+        "_get_running_jobs",
+        return_value=[{"job_id": "1", "name": job_name, "state": "RUNNING"}],
     ):
-        # The pending job is not in our tracked set
+        with pytest.raises(JobNotFoundError, match="grace period"):
+            api.verify_running_jobs(set())
+
+
+# ----------------------------------------------------------------------
+# jobs_pending / clear_*_jobs
+# ----------------------------------------------------------------------
+
+
+def test_jobs_pending_reflects_get_pending_jobs(
+    slurm_settings: SlurmManagerSettings,
+):
+    """``_get_pending_jobs`` is already tracked-scoped, so any result counts."""
+    api = SlurmBatchApi(slurm_settings)
+    _track(api, "12345")
+    with patch.object(api, "_get_pending_jobs", return_value=[]):
         assert api.jobs_pending() is False
     with patch.object(
         api,
@@ -180,11 +258,12 @@ def test_jobs_pending_only_counts_tracked(slurm_settings: SlurmManagerSettings):
         assert api.jobs_pending() is True
 
 
-def test_clear_successful_jobs_removes_from_set(
+def test_clear_successful_jobs_removes_from_set_and_times(
     slurm_settings: SlurmManagerSettings,
 ):
     api = SlurmBatchApi(slurm_settings)
-    api.tracked_jobs.update({"1", "2", "3"})
+    for jid in ("1", "2", "3"):
+        _track(api, jid)
     with patch.object(
         api,
         "_get_completed_jobs",
@@ -195,22 +274,26 @@ def test_clear_successful_jobs_removes_from_set(
     ):
         api.clear_successful_jobs()
     assert api.tracked_jobs == {"3"}
+    # _untrack should also clear the submission timestamps.
+    assert "1" not in api._submission_times
+    assert "2" not in api._submission_times
+    assert "3" in api._submission_times
 
 
-def test_clear_failed_jobs_removes_from_set(
+def test_clear_failed_jobs_removes_from_set_and_times(
     slurm_settings: SlurmManagerSettings,
 ):
     api = SlurmBatchApi(slurm_settings)
-    api.tracked_jobs.update({"1", "2", "3"})
+    for jid in ("1", "2", "3"):
+        _track(api, jid)
     with patch.object(
         api,
         "_get_failed_jobs",
-        return_value=[
-            {"job_id": "1", "name": "x", "state": "FAILED"},
-        ],
+        return_value=[{"job_id": "1", "name": "x", "state": "FAILED"}],
     ):
         api.clear_failed_jobs()
     assert api.tracked_jobs == {"2", "3"}
+    assert "1" not in api._submission_times
 
 
 def test_clear_successful_jobs_respects_setting(tmp_path: Path):
@@ -224,7 +307,7 @@ def test_clear_successful_jobs_respects_setting(tmp_path: Path):
         cleanup_successful_jobs=False,
     )
     api = SlurmBatchApi(settings)
-    api.tracked_jobs.add("1")
+    _track(api, "1")
     with patch.object(
         api,
         "_get_completed_jobs",
@@ -235,7 +318,69 @@ def test_clear_successful_jobs_respects_setting(tmp_path: Path):
     assert api.tracked_jobs == {"1"}
 
 
-def test_submit_job_parses_sbatch_output(
+# ----------------------------------------------------------------------
+# Tracked-scoped query helpers
+# ----------------------------------------------------------------------
+
+
+def test_squeue_tracked_skips_when_no_tracked_jobs(
+    slurm_settings: SlurmManagerSettings,
+):
+    """No tracked jobs -> no subprocess call at all (perf + correctness)."""
+    api = SlurmBatchApi(slurm_settings)
+    with patch("subprocess.run") as mock_run:
+        assert api._squeue_tracked("RUNNING") == []
+    mock_run.assert_not_called()
+
+
+def test_squeue_tracked_passes_jobs_filter(slurm_settings: SlurmManagerSettings):
+    """``--jobs=`` is built from ``tracked_jobs`` and ``--states=`` from arg."""
+    api = SlurmBatchApi(slurm_settings)
+    _track(api, "100")
+    _track(api, "200")
+    fake = type(
+        "R",
+        (),
+        {"stdout": "100|RUNNING|x\n", "stderr": "", "returncode": 0},
+    )
+    with patch("subprocess.run", return_value=fake) as mock_run:
+        api._squeue_tracked("RUNNING")
+    call_args = mock_run.call_args[0][0]
+    assert "--jobs=100,200" in call_args
+    assert "--states=RUNNING" in call_args
+
+
+def test_sacct_query_skips_when_no_tracked_jobs(
+    slurm_settings: SlurmManagerSettings,
+):
+    """No tracked jobs -> no sacct call. Avoids scanning the user's history."""
+    api = SlurmBatchApi(slurm_settings)
+    with patch("subprocess.run") as mock_run:
+        assert api._sacct_query("COMPLETED", set()) == []
+    mock_run.assert_not_called()
+
+
+def test_sacct_query_uses_jobs_filter_and_parsable_output(
+    slurm_settings: SlurmManagerSettings,
+):
+    """sacct is called with ``--jobs=`` (sidesteps lookback) and ``-P``
+    (pipe-separated parsable output)."""
+    api = SlurmBatchApi(slurm_settings)
+    fake = type("R", (), {"stdout": "", "stderr": "", "returncode": 0})
+    with patch("subprocess.run", return_value=fake) as mock_run:
+        api._sacct_query("COMPLETED", {"100", "200"})
+    call_args = mock_run.call_args[0][0]
+    assert "--jobs=100,200" in call_args
+    assert "-P" in call_args  # parsable / pipe-separated
+    assert "-X" in call_args  # main jobs only, no steps
+
+
+# ----------------------------------------------------------------------
+# submit_job
+# ----------------------------------------------------------------------
+
+
+def test_submit_job_parses_sbatch_output_and_tracks(
     slurm_settings: SlurmManagerSettings, tmp_path: Path
 ):
     api = SlurmBatchApi(slurm_settings)
@@ -250,6 +395,8 @@ def test_submit_job_parses_sbatch_output(
         job_id = api.submit_job(script)
     assert job_id == "99999"
     assert "99999" in api.tracked_jobs
+    # submit_job should also stamp the submission time via _track.
+    assert "99999" in api._submission_times
 
 
 def test_submit_job_raises_on_unparseable_output(
@@ -271,6 +418,11 @@ def test_no_cancel_job_method(slurm_settings: SlurmManagerSettings):
     """
     api = SlurmBatchApi(slurm_settings)
     assert not hasattr(api, "cancel_job")
+
+
+# ----------------------------------------------------------------------
+# Manager-level integration tests
+# ----------------------------------------------------------------------
 
 
 def _build_manager(

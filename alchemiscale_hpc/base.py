@@ -22,8 +22,9 @@ together with :class:`HPCBatchApi` and :class:`ScriptTemplateHPCManagerSettings`
 import os
 import tempfile
 from abc import ABC, abstractmethod
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 from uuid import uuid4
 
 import yaml
@@ -147,6 +148,19 @@ class ScriptTemplateHPCManagerSettings(HPCManagerSettings):
             "semantics as ``cleanup_successful_jobs``."
         ),
     )
+    job_registration_grace_period: int = Field(
+        120,
+        description=(
+            "Seconds to wait after submitting a job before treating it as "
+            "'should be registered with the server'. Between SLURM "
+            "transitioning a job to RUNNING and the compute service finishing "
+            "its registration handshake there is a brief window during which "
+            "the job is running but not yet known to the server. Bumping this "
+            "value avoids spurious JobNotFoundError on busy clusters; lowering "
+            "it makes the manager catch real registration failures faster. "
+            "Default 120 seconds."
+        ),
+    )
 
 
 class HPCBatchApi(ABC):
@@ -166,6 +180,32 @@ class HPCBatchApi(ABC):
         """
         self.settings = settings
         self.tracked_jobs: Set[str] = set()
+        # Submission timestamps for tracked jobs; populated by ``_track`` and
+        # consumed by ``_job_age``. Used to grant newly-submitted jobs a grace
+        # period before health checks treat them as "should be registered".
+        self._submission_times: Dict[str, datetime] = {}
+
+    # ------------------------------------------------------------------
+    # Tracking helpers (concrete; backends should call these rather than
+    # mutating ``tracked_jobs`` directly so submission timestamps stay in sync)
+    # ------------------------------------------------------------------
+
+    def _track(self, job_id: str) -> None:
+        """Record a newly-submitted job and stamp it with the current time."""
+        self.tracked_jobs.add(job_id)
+        self._submission_times[job_id] = datetime.now(tz=timezone.utc)
+
+    def _untrack(self, job_id: str) -> None:
+        """Forget a job (e.g. once it has completed or failed)."""
+        self.tracked_jobs.discard(job_id)
+        self._submission_times.pop(job_id, None)
+
+    def _job_age(self, job_id: str) -> Optional[timedelta]:
+        """Return how long ago ``job_id`` was submitted, or None if unknown."""
+        submitted = self._submission_times.get(job_id)
+        if submitted is None:
+            return None
+        return datetime.now(tz=timezone.utc) - submitted
 
     @abstractmethod
     def check_job_health(self) -> None:

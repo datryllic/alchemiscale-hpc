@@ -34,12 +34,22 @@ job_name_prefix: "alchemiscale"
 # Manager behavior settings
 
 # Time in seconds to sleep between manager cycles (default: 1800)
-# The manager checks for new tasks and scales services every sleep_interval seconds
+# The manager checks for new tasks and scales services every sleep_interval seconds.
+# Note: ramp-up rate is roughly (max_submit_per_cycle / sleep_interval). With
+# the defaults of 1 job per 30 minutes that's slow on purpose; tune both
+# together if you need to scale up faster.
 sleep_interval: 900  # 15 minutes
 
 # Maximum number of jobs to submit per cycle (default: 1)
-# Increase this to scale up faster, but be cautious of overwhelming SLURM
+# Increase this to scale up faster, but be cautious of overwhelming SLURM.
 max_submit_per_cycle: 2
+
+# Seconds to wait after submitting a job before treating it as "should be
+# registered with the alchemiscale server" (default: 120). Bumping this avoids
+# spurious JobNotFoundError on busy clusters where compute services take a
+# while to register; lowering it makes the manager catch real registration
+# failures faster.
+job_registration_grace_period: 120
 
 # Cleanup settings
 #

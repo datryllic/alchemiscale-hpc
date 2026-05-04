@@ -208,14 +208,44 @@ def _register_groups() -> None:
 
 # Lazily import known backend packages so they can self-register.
 def _autoload_backends() -> None:
+    """Import each known backend so its ``register_backend`` call fires.
+
+    A backend subpackage may be intentionally absent (e.g. someone vendored
+    only the SLURM bits), in which case we want to silently move on. But if
+    the subpackage *is* present and its import raises — typo, missing
+    dependency, syntax error — that almost certainly indicates a real bug
+    and should not be hidden from the operator.
+
+    We distinguish the two by checking the failed module name on the raised
+    :class:`ModuleNotFoundError`. Only the "top-level subpackage missing"
+    case is swallowed; nested import failures propagate.
+    """
     import importlib
+    import logging
+
+    logger = logging.getLogger(__name__)
 
     for backend in ("slurm", "lsf", "pbs"):
+        full_name = f"alchemiscale_hpc.{backend}"
         try:
-            importlib.import_module(f"alchemiscale_hpc.{backend}")
-        except ImportError:
-            # A backend might be intentionally absent; skip silently.
-            pass
+            importlib.import_module(full_name)
+        except ModuleNotFoundError as e:
+            if e.name == full_name:
+                # Subpackage is genuinely absent; nothing to register.
+                continue
+            logger.error(
+                "Failed to import backend %r: missing dependency %r. "
+                "The backend will not be available.",
+                backend,
+                e.name,
+            )
+            raise
+        except Exception:
+            logger.exception(
+                "Failed to import backend %r; the backend will not be available.",
+                backend,
+            )
+            raise
 
 
 _autoload_backends()
