@@ -98,7 +98,10 @@ class HPCManagerSettings(ComputeManagerSettings):
 
     job_name_prefix: str = Field(
         "alchemiscale",
-        description=("Prefix for batch job names. Full name will be <prefix>-<uuid>."),
+        description=(
+            "Prefix for batch job names. Full name will be "
+            "``<prefix>.<uuid_hex>`` (matches the alchemiscale-k8s convention)."
+        ),
     )
     max_submit_per_cycle: int = Field(
         1,
@@ -390,12 +393,16 @@ class ScriptTemplateHPCManager(HPCManager):
         return num_submitted
 
     def _generate_job_name(self) -> str:
-        """Return a unique job name of the form ``{prefix}-{uuid4}``.
+        """Return a unique job name of the form ``{prefix}.{uuid_hex}``.
 
-        The UUID portion uses the dashed string form, so the full name is
-        ``<prefix>-<8-4-4-4-12 hex>``.
+        Uses the same ``.``-separated format as the alchemiscale-k8s reference
+        backend (``f"{name}.{uuid4().hex}"``). The UUID portion is the 32-char
+        hex form (no internal dashes), which keeps the resulting
+        ComputeServiceID (``{name}-{uuid_hex}``) unambiguously parseable: the
+        only ``-`` is the one separating the service name from the trailing
+        hex suffix added by ``ComputeServiceID.new_from_name``.
         """
-        return f"{self.settings.job_name_prefix}-{uuid4()}"
+        return f"{self.settings.job_name_prefix}.{uuid4().hex}"
 
     def _render_template(self, substitutions: Dict[str, str]) -> str:
         """Substitute ``{{ KEY }}`` placeholders in the loaded template."""

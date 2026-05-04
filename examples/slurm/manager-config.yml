@@ -27,8 +27,9 @@ account: "myaccount"
 # Quality of Service specification
 qos: "normal"
 
-# Prefix for SLURM job names
-# Full job name will be: <prefix>-<uuid>
+# Prefix for SLURM job names.
+# Full job name will be: <prefix>.<uuid_hex>
+# (Matches the alchemiscale-k8s naming convention.)
 job_name_prefix: "alchemiscale"
 
 # Manager behavior settings
