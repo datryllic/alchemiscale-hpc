@@ -319,7 +319,19 @@ class ScriptTemplateHPCManager(HPCManager):
     2. Verify running jobs are registered with the server.
     3. Clear successful jobs (semantics are backend-specific; see
        :meth:`HPCBatchApi.clear_successful_jobs`).
-    4. If no jobs are pending, submit up to ``max_submit_per_cycle`` new jobs.
+    4. If no jobs are pending, decide how many new services to create as
+
+           min(num_tasks, max_submit_per_cycle, remaining_capacity) // claim_limit
+
+       (with a floor of one if the parent has decided we should scale up at
+       all), and submit that many.
+
+    The sizing rule mirrors the alchemiscale-k8s ``K8SManager``: each new
+    compute service can claim up to ``claim_limit`` tasks at a time, so to
+    cover ``num_tasks`` waiting tasks we need ~``num_tasks / claim_limit``
+    services; ``max_submit_per_cycle`` rate-limits how aggressively we ramp
+    up; and ``max_compute_services - len(compute_service_ids)`` keeps us
+    under the configured capacity ceiling.
 
     Subclasses only need to implement :meth:`_create_job_script`, which renders
     the template into a script ready for ``submit_job``.
@@ -342,6 +354,16 @@ class ScriptTemplateHPCManager(HPCManager):
 
         Called by the parent :class:`ComputeManager` when scaling up is needed.
 
+        The number of jobs submitted is
+
+            ``min(num_tasks, max_submit_per_cycle, remaining_capacity)
+            // claim_limit``
+
+        floored at one (the parent only calls us when ``num_tasks > 0`` and
+        ``len(compute_service_ids) < max_compute_services``, so there is at
+        least one task to serve and one slot to fill). This mirrors the
+        sizing logic in ``alchemiscale_k8s.K8SManager.create_compute_services``.
+
         Parameters
         ----------
         data
@@ -356,9 +378,12 @@ class ScriptTemplateHPCManager(HPCManager):
             Number of new compute services created.
         """
         compute_service_ids = data["compute_service_ids"]
+        num_tasks = data["num_tasks"]
+
         # Each ComputeServiceID has form "{name}-{uuid_hex}". Strip only the
         # trailing hex suffix so that service `name` (which may itself contain
-        # hyphens, e.g. "alchemiscale-<uuid4>") is preserved intact.
+        # hyphens, e.g. when ``job_name_prefix`` includes one) is preserved
+        # intact.
         server_job_names = {csid.rsplit("-", 1)[0] for csid in compute_service_ids}
 
         self.logger.info("Checking health of batch jobs")
@@ -374,8 +399,16 @@ class ScriptTemplateHPCManager(HPCManager):
             self.logger.info("Skipping job creation, pending jobs exist")
             return 0
 
+        jobs_to_create = self._compute_jobs_to_create(
+            num_tasks=num_tasks,
+            num_active_services=len(compute_service_ids),
+        )
+        if jobs_to_create == 0:
+            self.logger.info("No new jobs to create this cycle")
+            return 0
+
         num_submitted = 0
-        for _ in range(self.settings.max_submit_per_cycle):
+        for _ in range(jobs_to_create):
             job_script_path = self._create_job_script()
             try:
                 job_id = self.batch_api.submit_job(job_script_path)
@@ -391,6 +424,46 @@ class ScriptTemplateHPCManager(HPCManager):
                     except OSError:
                         pass
         return num_submitted
+
+    def _compute_jobs_to_create(self, num_tasks: int, num_active_services: int) -> int:
+        """Decide how many new jobs to submit this cycle.
+
+        Mirrors the ``K8SManager`` sizing logic, exposed as a separate method
+        so it can be unit-tested without standing up a full manager + batch
+        API. See :meth:`create_compute_services` for the full formula.
+        """
+        remaining_capacity = self.settings.max_compute_services - num_active_services
+        # Defensive: if somehow we're already at or over capacity, do nothing.
+        if remaining_capacity <= 0 or num_tasks <= 0:
+            return 0
+
+        jobs_to_create = min(
+            num_tasks,
+            self.settings.max_submit_per_cycle,
+            remaining_capacity,
+        )
+
+        # Each compute service claims up to ``claim_limit`` tasks at a time,
+        # so we need fewer services than tasks to cover the queue.
+        claim_limit = max(1, self.service_settings.claim_limit)
+        jobs_to_create //= claim_limit
+
+        # The parent guarantees we got here because we should scale up. If
+        # the divide collapsed to zero (e.g. one task with claim_limit=2),
+        # still create one job rather than stalling.
+        if jobs_to_create == 0:
+            jobs_to_create = 1
+
+        self.logger.info(
+            "Sizing: num_tasks=%d, max_submit_per_cycle=%d, "
+            "remaining_capacity=%d, claim_limit=%d -> create %d job(s)",
+            num_tasks,
+            self.settings.max_submit_per_cycle,
+            remaining_capacity,
+            claim_limit,
+            jobs_to_create,
+        )
+        return jobs_to_create
 
     def _generate_job_name(self) -> str:
         """Return a unique job name of the form ``{prefix}.{uuid_hex}``.

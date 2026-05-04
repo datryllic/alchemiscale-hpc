@@ -527,6 +527,139 @@ def test_slurm_manager_keep_job_scripts(
     submitted_paths[0].unlink()
 
 
+# ----------------------------------------------------------------------
+# Sizing logic (_compute_jobs_to_create) — mirrors K8SManager
+# ----------------------------------------------------------------------
+
+
+def test_sizing_capped_by_num_tasks(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """Don't submit more services than there are waiting tasks."""
+    settings = slurm_settings.model_copy(
+        update={"max_compute_services": 100, "max_submit_per_cycle": 100}
+    )
+    mgr = _build_manager(settings, tmp_path)
+    # claim_limit defaults to 1, so the divide is a no-op.
+    assert mgr._compute_jobs_to_create(num_tasks=3, num_active_services=0) == 3
+
+
+def test_sizing_capped_by_max_submit_per_cycle(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """``max_submit_per_cycle`` rate-limits ramp-up."""
+    settings = slurm_settings.model_copy(
+        update={"max_compute_services": 100, "max_submit_per_cycle": 2}
+    )
+    mgr = _build_manager(settings, tmp_path)
+    # 100 tasks, but rate-limited to 2 per cycle.
+    assert mgr._compute_jobs_to_create(num_tasks=100, num_active_services=0) == 2
+
+
+def test_sizing_capped_by_remaining_capacity(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """``max_compute_services - active_services`` is the hard ceiling."""
+    settings = slurm_settings.model_copy(
+        update={"max_compute_services": 5, "max_submit_per_cycle": 100}
+    )
+    mgr = _build_manager(settings, tmp_path)
+    # 4 active, capacity is 5 -> 1 slot left
+    assert mgr._compute_jobs_to_create(num_tasks=100, num_active_services=4) == 1
+
+
+def test_sizing_returns_zero_at_capacity(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """At/over capacity, we don't submit anything (defensive — the parent
+    normally gates this case before calling us)."""
+    settings = slurm_settings.model_copy(update={"max_compute_services": 5})
+    mgr = _build_manager(settings, tmp_path)
+    assert mgr._compute_jobs_to_create(num_tasks=10, num_active_services=5) == 0
+    assert mgr._compute_jobs_to_create(num_tasks=10, num_active_services=6) == 0
+
+
+def test_sizing_returns_zero_when_no_tasks(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """Defensive: no tasks -> no jobs, even if there's slack capacity."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    assert mgr._compute_jobs_to_create(num_tasks=0, num_active_services=0) == 0
+
+
+def test_sizing_divides_by_claim_limit(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """A service that claims N tasks at once means ~num_tasks/N services."""
+    settings = slurm_settings.model_copy(
+        update={"max_compute_services": 100, "max_submit_per_cycle": 100}
+    )
+    mgr = _build_manager(settings, tmp_path)
+    # Override claim_limit on the loaded service settings.
+    mgr.service_settings.claim_limit = 5
+    # 20 tasks, claim_limit 5 -> 4 services
+    assert mgr._compute_jobs_to_create(num_tasks=20, num_active_services=0) == 4
+
+
+def test_sizing_floors_to_one_when_divide_collapses(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """If integer-divide by claim_limit gives 0, still create one service.
+
+    Regression for the K8s-mirrored ``if jobs_to_create == 0: jobs_to_create = 1``
+    rule: with one task and claim_limit=2, ``1 // 2 == 0``, but the parent
+    has already decided we should scale up, so we create one anyway. The
+    next cycle will catch up if needed.
+    """
+    settings = slurm_settings.model_copy(
+        update={"max_compute_services": 10, "max_submit_per_cycle": 10}
+    )
+    mgr = _build_manager(settings, tmp_path)
+    mgr.service_settings.claim_limit = 5
+    # 2 tasks, claim_limit 5 -> 2 // 5 == 0 -> floor to 1
+    assert mgr._compute_jobs_to_create(num_tasks=2, num_active_services=0) == 1
+
+
+def test_sizing_handles_zero_claim_limit_defensively(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """A claim_limit of 0 (degenerate config) shouldn't cause ZeroDivisionError."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    mgr.service_settings.claim_limit = 0
+    # Shouldn't raise; treated as if claim_limit were 1.
+    result = mgr._compute_jobs_to_create(num_tasks=3, num_active_services=0)
+    assert result >= 1
+
+
+def test_create_compute_services_respects_sizing(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """End-to-end check: 5 tasks, claim_limit=5 -> exactly 1 job submitted."""
+    settings = slurm_settings.model_copy(
+        update={"max_compute_services": 100, "max_submit_per_cycle": 10}
+    )
+    mgr = _build_manager(settings, tmp_path)
+    mgr.service_settings.claim_limit = 5
+
+    submitted = []
+
+    def _fake_submit(path: Path) -> str:
+        submitted.append(path)
+        return f"id-{len(submitted)}"
+
+    with patch.object(mgr.batch_api, "check_job_health"), patch.object(
+        mgr.batch_api, "verify_running_jobs"
+    ), patch.object(mgr.batch_api, "clear_successful_jobs"), patch.object(
+        mgr.batch_api, "jobs_pending", return_value=False
+    ), patch.object(
+        mgr.batch_api, "submit_job", side_effect=_fake_submit
+    ):
+        n = mgr.create_compute_services({"compute_service_ids": [], "num_tasks": 5})
+    # 5 tasks // claim_limit 5 = 1 job.
+    assert n == 1
+    assert len(submitted) == 1
+
+
 def test_create_compute_services_skips_when_pending(
     slurm_settings: SlurmManagerSettings, tmp_path: Path
 ):
