@@ -169,8 +169,39 @@ class ScriptTemplateHPCManagerSettings(HPCManagerSettings):
 class HPCBatchApi(ABC):
     """Abstract base class for HPC batch system APIs.
 
-    Each queueing system (SLURM, LSF, PBS) should implement this interface
-    to provide a consistent way to interact with the batch system.
+    Each queueing system (SLURM, LSF, PBS) implements this interface to give
+    the manager and CLI a consistent way to interact with the batch system.
+    All methods below are abstract; backends must implement every one.
+
+    The methods serve two distinct purposes — both required for a
+    production-quality backend, but useful to know which is which when
+    implementing or maintaining a new system:
+
+    **Manager-loop primitives** (called every cycle by
+    :meth:`ScriptTemplateHPCManager.create_compute_services`; correctness
+    of autoscaling depends on these):
+
+    * :meth:`check_job_health` --- raise on tracked-job failure
+    * :meth:`verify_running_jobs` --- sanity-check running jobs are
+      registered with the alchemiscale server
+    * :meth:`clear_successful_jobs` --- per-cycle cleanup of finished jobs
+      (backend-defined: in-memory for SLURM-style, real deletion for
+      Kubernetes-style)
+    * :meth:`jobs_pending` --- gate that lets the cycle skip submitting
+      while prior submissions are still queueing
+    * :meth:`submit_job` --- the actual submission
+
+    **Operator/diagnostic primitives** (only invoked by the
+    ``alchemiscale-hpc <backend> ...`` CLI; the autoscaling loop never
+    calls these):
+
+    * :meth:`get_jobs` --- backs ``show-jobs``
+    * :meth:`clear_failed_jobs` --- backs ``cleanup --failed``
+
+    The split reflects intent, not optionality. The CLI is part of the
+    operator interface for any production deployment, so a backend that
+    leaves ``get_jobs`` or ``clear_failed_jobs`` as no-ops is shipping a
+    half-finished operator experience.
     """
 
     def __init__(self, settings: HPCManagerSettings):
@@ -210,6 +241,12 @@ class HPCBatchApi(ABC):
             return None
         return datetime.now(tz=timezone.utc) - submitted
 
+    # ------------------------------------------------------------------
+    # Manager-loop primitives
+    # ------------------------------------------------------------------
+    # Called every cycle by ScriptTemplateHPCManager.create_compute_services.
+    # Correctness of autoscaling depends on these.
+
     @abstractmethod
     def check_job_health(self) -> None:
         """Raise :class:`JobFailureError` if any tracked job has failed."""
@@ -242,21 +279,23 @@ class HPCBatchApi(ABC):
         """
 
     @abstractmethod
-    def clear_failed_jobs(self) -> None:
-        """Operator-driven cleanup hook for failed jobs.
-
-        Mirrors :meth:`clear_successful_jobs` but for failed jobs. Not called
-        on every cycle; reached via the ``alchemiscale-hpc <backend> cleanup
-        --failed`` CLI command after an operator has investigated a failure.
-        """
-
-    @abstractmethod
     def jobs_pending(self) -> bool:
         """Return True if any tracked jobs are in a pending (not-yet-running) state."""
 
     @abstractmethod
+    def submit_job(self, script_path: Path) -> str:
+        """Submit ``script_path`` to the batch system and return the job ID."""
+
+    # ------------------------------------------------------------------
+    # Operator/diagnostic primitives
+    # ------------------------------------------------------------------
+    # Not called by the manager loop. These back the operator-facing
+    # ``alchemiscale-hpc <backend> ...`` CLI commands; backends should
+    # still implement them for a complete operator experience.
+
+    @abstractmethod
     def get_jobs(self) -> List[Dict[str, str]]:
-        """Get all jobs in the queue.
+        """Get all jobs in the queue. Backs ``alchemiscale-hpc <backend> show-jobs``.
 
         Returns
         -------
@@ -265,8 +304,14 @@ class HPCBatchApi(ABC):
         """
 
     @abstractmethod
-    def submit_job(self, script_path: Path) -> str:
-        """Submit ``script_path`` to the batch system and return the job ID."""
+    def clear_failed_jobs(self) -> None:
+        """Operator-driven cleanup hook for failed jobs. Backs
+        ``alchemiscale-hpc <backend> cleanup --failed``.
+
+        Mirrors :meth:`clear_successful_jobs` but for failed jobs. Not called
+        on every cycle; only reached after an operator has investigated a
+        failure and asked to clear the wreckage.
+        """
 
 
 class HPCManager(ComputeManager, ABC):
