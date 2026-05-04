@@ -1,0 +1,100 @@
+# Example configuration file for SlurmManager
+#
+# This file configures the compute manager that autoscales compute services
+# by submitting SLURM batch jobs based on task availability.
+
+# Unique name for this manager (required)
+# Should be distinct from all other compute managers
+name: "my-slurm-manager"
+
+# Path to SLURM job script template (required)
+# The manager will use this template to generate job scripts
+job_script_template: "/path/to/job-template.sh"
+
+# Maximum number of concurrent compute services (required)
+# The manager will not exceed this number of running jobs
+max_compute_services: 10
+
+# SLURM-specific settings (optional)
+# If not specified, SLURM will use defaults
+
+# SLURM partition to submit jobs to
+partition: "gpu"
+
+# SLURM account to charge jobs to
+account: "myaccount"
+
+# Quality of Service specification
+qos: "normal"
+
+# Prefix for SLURM job names.
+# Full job name will be: <prefix>.<uuid_hex>
+# (Matches the alchemiscale-k8s naming convention.)
+job_name_prefix: "alchemiscale"
+
+# Manager behavior settings
+
+# Time in seconds to sleep between manager cycles (default: 1800)
+# The manager checks for new tasks and scales services every sleep_interval seconds.
+# Note: ramp-up rate is roughly (max_submit_per_cycle / sleep_interval). With
+# the defaults of 1 job per 30 minutes that's slow on purpose; tune both
+# together if you need to scale up faster.
+sleep_interval: 900  # 15 minutes
+
+# Maximum number of jobs to submit per cycle (default: 1)
+# Increase this to scale up faster, but be cautious of overwhelming SLURM.
+max_submit_per_cycle: 2
+
+# Seconds to wait after submitting a job before treating it as "should be
+# registered with the alchemiscale server" (default: 120). Bumping this avoids
+# spurious JobNotFoundError on busy clusters where compute services take a
+# while to register; lowering it makes the manager catch real registration
+# failures faster.
+job_registration_grace_period: 120
+
+# Cleanup settings
+#
+# For SLURM, "cleanup" means removing job IDs from the manager's in-memory
+# tracking set. SLURM accounting (sacct) records are immutable history and
+# are not modified by these flags. (Other backends — e.g. Kubernetes — can
+# interpret these flags as actually deleting Job objects from the batch
+# system.)
+
+# Run the per-cycle clear_successful_jobs step (default: true).
+cleanup_successful_jobs: true
+
+# Run clear_failed_jobs when `alchemiscale-hpc slurm cleanup --failed` is
+# invoked (default: true).
+cleanup_failed_jobs: true
+
+# Job script handling
+
+# Directory to write rendered job scripts into. If omitted, the system temp
+# directory is used. The directory will be created if it does not exist.
+# job_script_dir: "/path/to/job-scripts"
+
+# If true, do not delete rendered job scripts after submission. Useful for
+# debugging template substitution. Default: false.
+# keep_job_scripts: false
+
+# Logging settings
+
+# Log level (default: "WARN")
+# Options: DEBUG, INFO, WARN, ERROR
+loglevel: "INFO"
+
+# Path to log file (optional)
+# If not set, logs only go to STDOUT
+logfile: "/path/to/logs/manager.log"
+
+# SLURM command overrides (optional)
+# Only change these if your SLURM commands are non-standard
+
+# Command to submit jobs (default: "sbatch")
+# submit_command: "sbatch"
+
+# Command to query job queue (default: "squeue")
+# query_command: "squeue"
+
+# Command to query accounting (default: "sacct")
+# accounting_command: "sacct"
