@@ -30,9 +30,10 @@ keep_scratch: false
 
 # Scopes to claim tasks from (optional)
 # If not specified, will claim from all accessible scopes
-# Format: org-campaign-project or org-* or org-campaign-*
+# Format: org-campaign-project (each component is a single token; wildcards
+# allowed, e.g. myorg-*-*). Note an org name cannot itself contain '-'.
 scopes:
-  - "my-org-*-*"  # All campaigns and projects in my-org
+  - "myorg-*-*"  # All campaigns and projects in the 'myorg' org
 
 # Protocol names to run (optional)
 # If specified, only tasks for these protocols will be claimed
@@ -55,6 +56,20 @@ deep_sleep_interval: 600
 
 # Frequency of heartbeats to compute API in seconds (default: 300)
 heartbeat_interval: 300
+
+# Service lifetime limits
+#
+# For HPC job-based execution we recommend a small task limit (ideally 1) and a
+# time limit slightly under the job's walltime. The service shuts down when the
+# first limit is hit, so a service that claims a Task has nearly the full
+# walltime to execute it, and a service that fails to claim one exits promptly
+# instead of idling.
+
+# Maximum number of Tasks to execute before exiting (default: null = no limit)
+max_tasks: 1
+
+# Maximum number of seconds to run before exiting (default: null = no limit)
+max_time: 84600
 
 # Client settings
 
