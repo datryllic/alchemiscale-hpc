@@ -57,10 +57,12 @@ def test_slurm_batch_api_is_concrete(slurm_settings: SlurmManagerSettings):
 
 
 def test_slurm_settings_extends_script_template_base():
-    """SlurmManagerSettings exposes both base and script-template fields."""
+    """SlurmManagerSettings exposes the inherited fields and SLURM-specific ones."""
     fields = set(SlurmManagerSettings.model_fields)
+    # Inherited from upstream ComputeManagerSettings:
+    assert "max_submit_per_cycle" in fields
     # Inherited from HPCManagerSettings:
-    assert {"job_name_prefix", "max_submit_per_cycle"} <= fields
+    assert "job_name_prefix" in fields
     # Inherited from ScriptTemplateHPCManagerSettings:
     assert {
         "job_script_template",
@@ -493,7 +495,9 @@ def test_slurm_manager_create_compute_services_cleans_up_scripts(
     ), patch.object(
         mgr.batch_api, "submit_job", side_effect=_fake_submit
     ):
-        n = mgr.create_compute_services({"compute_service_ids": [], "num_tasks": 1})
+        n = mgr.create_compute_services(
+            {"compute_service_ids": [], "num_tasks": 1}, target=1
+        )
     assert n == 1
     assert submitted_paths
     # The script should have been removed after submission.
@@ -521,125 +525,30 @@ def test_slurm_manager_keep_job_scripts(
     ), patch.object(
         mgr.batch_api, "submit_job", side_effect=_fake_submit
     ):
-        mgr.create_compute_services({"compute_service_ids": [], "num_tasks": 1})
+        mgr.create_compute_services(
+            {"compute_service_ids": [], "num_tasks": 1}, target=1
+        )
     # The script should still exist.
     assert submitted_paths[0].exists()
     submitted_paths[0].unlink()
 
 
 # ----------------------------------------------------------------------
-# Sizing logic (_compute_jobs_to_create) — mirrors K8SManager
+# create_compute_services target handling
 # ----------------------------------------------------------------------
+#
+# The sizing math itself (min(num_tasks, max_submit_per_cycle, capacity)
+# // claim_limit, with floor-to-1) lives upstream in
+# ``alchemiscale.compute.manager.ComputeManager._compute_jobs_to_create``
+# and is unit-tested there. The tests below verify only that we honor
+# the ``target`` we receive and short-circuit for backend-specific reasons.
 
 
-def test_sizing_capped_by_num_tasks(
+def test_create_compute_services_honors_target(
     slurm_settings: SlurmManagerSettings, tmp_path: Path
 ):
-    """Don't submit more services than there are waiting tasks."""
-    settings = slurm_settings.model_copy(
-        update={"max_compute_services": 100, "max_submit_per_cycle": 100}
-    )
-    mgr = _build_manager(settings, tmp_path)
-    # claim_limit defaults to 1, so the divide is a no-op.
-    assert mgr._compute_jobs_to_create(num_tasks=3, num_active_services=0) == 3
-
-
-def test_sizing_capped_by_max_submit_per_cycle(
-    slurm_settings: SlurmManagerSettings, tmp_path: Path
-):
-    """``max_submit_per_cycle`` rate-limits ramp-up."""
-    settings = slurm_settings.model_copy(
-        update={"max_compute_services": 100, "max_submit_per_cycle": 2}
-    )
-    mgr = _build_manager(settings, tmp_path)
-    # 100 tasks, but rate-limited to 2 per cycle.
-    assert mgr._compute_jobs_to_create(num_tasks=100, num_active_services=0) == 2
-
-
-def test_sizing_capped_by_remaining_capacity(
-    slurm_settings: SlurmManagerSettings, tmp_path: Path
-):
-    """``max_compute_services - active_services`` is the hard ceiling."""
-    settings = slurm_settings.model_copy(
-        update={"max_compute_services": 5, "max_submit_per_cycle": 100}
-    )
-    mgr = _build_manager(settings, tmp_path)
-    # 4 active, capacity is 5 -> 1 slot left
-    assert mgr._compute_jobs_to_create(num_tasks=100, num_active_services=4) == 1
-
-
-def test_sizing_returns_zero_at_capacity(
-    slurm_settings: SlurmManagerSettings, tmp_path: Path
-):
-    """At/over capacity, we don't submit anything (defensive — the parent
-    normally gates this case before calling us)."""
-    settings = slurm_settings.model_copy(update={"max_compute_services": 5})
-    mgr = _build_manager(settings, tmp_path)
-    assert mgr._compute_jobs_to_create(num_tasks=10, num_active_services=5) == 0
-    assert mgr._compute_jobs_to_create(num_tasks=10, num_active_services=6) == 0
-
-
-def test_sizing_returns_zero_when_no_tasks(
-    slurm_settings: SlurmManagerSettings, tmp_path: Path
-):
-    """Defensive: no tasks -> no jobs, even if there's slack capacity."""
+    """Given target=N, submit exactly N scripts."""
     mgr = _build_manager(slurm_settings, tmp_path)
-    assert mgr._compute_jobs_to_create(num_tasks=0, num_active_services=0) == 0
-
-
-def test_sizing_divides_by_claim_limit(
-    slurm_settings: SlurmManagerSettings, tmp_path: Path
-):
-    """A service that claims N tasks at once means ~num_tasks/N services."""
-    settings = slurm_settings.model_copy(
-        update={"max_compute_services": 100, "max_submit_per_cycle": 100}
-    )
-    mgr = _build_manager(settings, tmp_path)
-    # Override claim_limit on the loaded service settings.
-    mgr.service_settings.claim_limit = 5
-    # 20 tasks, claim_limit 5 -> 4 services
-    assert mgr._compute_jobs_to_create(num_tasks=20, num_active_services=0) == 4
-
-
-def test_sizing_floors_to_one_when_divide_collapses(
-    slurm_settings: SlurmManagerSettings, tmp_path: Path
-):
-    """If integer-divide by claim_limit gives 0, still create one service.
-
-    Regression for the K8s-mirrored ``if jobs_to_create == 0: jobs_to_create = 1``
-    rule: with one task and claim_limit=2, ``1 // 2 == 0``, but the parent
-    has already decided we should scale up, so we create one anyway. The
-    next cycle will catch up if needed.
-    """
-    settings = slurm_settings.model_copy(
-        update={"max_compute_services": 10, "max_submit_per_cycle": 10}
-    )
-    mgr = _build_manager(settings, tmp_path)
-    mgr.service_settings.claim_limit = 5
-    # 2 tasks, claim_limit 5 -> 2 // 5 == 0 -> floor to 1
-    assert mgr._compute_jobs_to_create(num_tasks=2, num_active_services=0) == 1
-
-
-def test_sizing_handles_zero_claim_limit_defensively(
-    slurm_settings: SlurmManagerSettings, tmp_path: Path
-):
-    """A claim_limit of 0 (degenerate config) shouldn't cause ZeroDivisionError."""
-    mgr = _build_manager(slurm_settings, tmp_path)
-    mgr.service_settings.claim_limit = 0
-    # Shouldn't raise; treated as if claim_limit were 1.
-    result = mgr._compute_jobs_to_create(num_tasks=3, num_active_services=0)
-    assert result >= 1
-
-
-def test_create_compute_services_respects_sizing(
-    slurm_settings: SlurmManagerSettings, tmp_path: Path
-):
-    """End-to-end check: 5 tasks, claim_limit=5 -> exactly 1 job submitted."""
-    settings = slurm_settings.model_copy(
-        update={"max_compute_services": 100, "max_submit_per_cycle": 10}
-    )
-    mgr = _build_manager(settings, tmp_path)
-    mgr.service_settings.claim_limit = 5
 
     submitted = []
 
@@ -654,15 +563,18 @@ def test_create_compute_services_respects_sizing(
     ), patch.object(
         mgr.batch_api, "submit_job", side_effect=_fake_submit
     ):
-        n = mgr.create_compute_services({"compute_service_ids": [], "num_tasks": 5})
-    # 5 tasks // claim_limit 5 = 1 job.
-    assert n == 1
-    assert len(submitted) == 1
+        n = mgr.create_compute_services(
+            {"compute_service_ids": [], "num_tasks": 100}, target=3
+        )
+    assert n == 3
+    assert len(submitted) == 3
 
 
 def test_create_compute_services_skips_when_pending(
     slurm_settings: SlurmManagerSettings, tmp_path: Path
 ):
+    """Backend gate: if any submitted jobs are still pending, do nothing
+    even when ``target`` says to scale up."""
     mgr = _build_manager(slurm_settings, tmp_path)
     with patch.object(mgr.batch_api, "check_job_health"), patch.object(
         mgr.batch_api, "verify_running_jobs"
@@ -671,7 +583,9 @@ def test_create_compute_services_skips_when_pending(
     ), patch.object(
         mgr.batch_api, "submit_job"
     ) as submit:
-        n = mgr.create_compute_services({"compute_service_ids": [], "num_tasks": 5})
+        n = mgr.create_compute_services(
+            {"compute_service_ids": [], "num_tasks": 5}, target=5
+        )
     assert n == 0
     submit.assert_not_called()
 
@@ -703,7 +617,7 @@ def test_create_compute_services_strips_uuid_suffix_correctly(
         mgr.batch_api, "jobs_pending", return_value=True
     ):
         mgr.create_compute_services(
-            {"compute_service_ids": [service_id], "num_tasks": 0}
+            {"compute_service_ids": [service_id], "num_tasks": 0}, target=0
         )
 
     assert captured["names"] == {service_name}
@@ -736,7 +650,7 @@ def test_create_compute_services_handles_dashed_prefix(
         mgr.batch_api, "jobs_pending", return_value=True
     ):
         mgr.create_compute_services(
-            {"compute_service_ids": [service_id], "num_tasks": 0}
+            {"compute_service_ids": [service_id], "num_tasks": 0}, target=0
         )
 
     assert captured["names"] == {service_name}

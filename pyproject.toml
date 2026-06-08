@@ -24,6 +24,9 @@ Issues = "https://github.com/datryllic/alchemiscale-hpc/issues"
 [project.scripts]
 alchemiscale-hpc = "alchemiscale_hpc.cli:cli"
 
+[tool.setuptools.packages.find]
+include = ["alchemiscale_hpc*"]
+
 [project.optional-dependencies]
 test = ["pytest"]
 
