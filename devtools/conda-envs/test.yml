@@ -2,9 +2,29 @@ name: alchemiscale-hpc-test
 channels:
   - conda-forge
 
+# alchemiscale itself is installed from git main via pip in CI (--no-deps),
+# until #502 lands in a conda-forge release. These are its runtime
+# dependencies (mirroring the alchemiscale-client/-compute feedstock) plus
+# this package's own needs and test tooling.
 dependencies:
-  - alchemiscale-compute
-  - click
-  - pyyaml
   - pip
   - pytest
+
+  # alchemiscale runtime deps
+  - requests
+  - click
+  - rich
+  - httpx
+  - nest-asyncio
+  - pydantic-settings
+  - pydantic >2
+  - zstandard
+  - diskcache
+  - async-lru
+  - stratocaster
+  - gufe >=1.2.0
+  - libsqlite <3.49
+  - openff-interchange >=0.3.18,!=0.4.2
+
+  # alchemiscale-hpc deps
+  - pyyaml
