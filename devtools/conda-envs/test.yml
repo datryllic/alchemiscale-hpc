@@ -1,0 +1,10 @@
+name: alchemiscale-hpc-test
+channels:
+  - conda-forge
+
+dependencies:
+  - alchemiscale-compute
+  - click
+  - pyyaml
+  - pip
+  - pytest
