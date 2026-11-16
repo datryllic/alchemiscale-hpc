@@ -64,12 +64,21 @@ def _build_backend_group(backend: str) -> click.Group:
     @config_option
     @service_option
     def start(config_file: Path, service_config_file: Path) -> None:
+        from alchemiscale.compute.signals import install_stop_handlers
+
         manager_cls, _, _ = _base.get_backend(backend)
         settings = _load_settings(config_file, backend)
         manager = manager_cls(
             settings=settings, service_settings_path=service_config_file
         )
-        manager.start()
+
+        # install handlers so SIGHUP/SIGINT/SIGTERM stop the manager cleanly
+        install_stop_handlers(manager)
+
+        try:
+            manager.start()
+        except KeyboardInterrupt:
+            pass
 
     @group.command(
         name="clear-error",
