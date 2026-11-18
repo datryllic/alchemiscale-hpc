@@ -187,12 +187,15 @@ def test_cleanup_reports_successful_jobs(slurm_config):
 
 
 def test_cleanup_failed_ignores_disabled_setting(slurm_config):
-    """``cleanup_failed_jobs`` does not apply to SLURM; the report still runs."""
+    """``cleanup_failed_jobs`` is ignored (with a warning); the report still
+    runs."""
     slurm_config.write_text(
         slurm_config.read_text() + "cleanup_failed_jobs: false\n"
     )
     runner = CliRunner()
-    with patch.object(SlurmBatchApi, "recover_jobs", return_value=[]):
+    with patch.object(SlurmBatchApi, "recover_jobs", return_value=[]), pytest.warns(
+        FutureWarning, match="cleanup_failed_jobs=False is ignored"
+    ):
         result = runner.invoke(
             cli, ["slurm", "cleanup", "-c", str(slurm_config), "--failed"]
         )

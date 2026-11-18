@@ -123,7 +123,7 @@ The package uses a modular architecture with two abstraction layers:
      at startup, so ownership survives restarts. `HPCManager` logs and
      untracks failed jobs every cycle, and stops only when jobs fail, or
      every submission fails, in more than `max_consecutive_failed_cycles`
-     consecutive cycles.
+     cycles with no sign of a healthy job.
    - `HPCManagerSettings`: settings every backend needs (`name`,
      `max_submit_per_cycle`, ...). Job names are built as
      `<name>.<uuid_hex>`, so `name` is validated against alchemiscale's

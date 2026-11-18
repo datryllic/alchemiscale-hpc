@@ -127,10 +127,11 @@ alchemiscale-hpc slurm clear-error \
 
 ### Failed Jobs
 
-A failed job (`FAILED`, `TIMEOUT`, `CANCELLED`, `NODE_FAIL`, `PREEMPTED`)
-does not stop the manager. Each cycle that checks its jobs, the manager logs
-every newly failed job at ERROR with its `sacct` state, exit code, and
-reason, for example:
+A failed job (`FAILED`, `TIMEOUT`, `CANCELLED`, `NODE_FAIL`, `PREEMPTED`,
+`OUT_OF_MEMORY`, `BOOT_FAIL`, `DEADLINE`) does not stop the manager. Each
+cycle that checks its jobs, the manager logs every newly failed job at ERROR
+with its `sacct` state and exit code (and last pending reason, if any), for
+example:
 
 ```
 Batch job 4242 failed: CANCELLED by 1000, exit code 0, signal 15
@@ -138,9 +139,19 @@ Batch job 4242 failed: CANCELLED by 1000, exit code 0, signal 15
 
 and stops tracking it. The manager stops with `JobFailureError` only if
 failed jobs are found in more than `max_consecutive_failed_cycles` (default
-5) consecutive checks, and with `JobSubmissionError` if every `sbatch` fails
-in more than that many consecutive cycles that submit. Either usually means
-a broken job script template or settings (partition, account, QoS).
+5) checks with no sign of a healthy job in between: one of its jobs
+completing, or one of its compute services registered with the server.
+Checks that only see pending jobs neither count nor reset. So routine
+preemptions and timeouts in a working fleet never stop the manager, while
+jobs that fail without ever registering do, even if they pend first.
+
+Likewise, it stops with `JobSubmissionError` if every `sbatch` fails in more
+than that many cycles while none of its compute services is registered;
+failures at a submit limit (e.g. `MaxSubmitJobsPerUser`) with a running
+fleet do not count. The error includes `sbatch`'s message. Either error
+usually means a broken job script template or settings (partition, account,
+QoS). With a short `sleep_interval`, raise the limit so that a brief
+`slurmctld` outage does not stop the manager.
 
 A running job that is not registered with the server, past
 `job_registration_grace_period` from when it started, is logged at WARNING
@@ -164,16 +175,21 @@ alchemiscale-hpc slurm cleanup -c my-manager-config.yml --successful
 `cleanup` finds the manager's jobs by name in `squeue` and, for jobs that
 finished in the last 7 days, in `sacct`, and reports the failed or successful
 ones. It only reads SLURM: accounting (`sacct`) records, job scripts, and a
-running manager are unaffected. To prevent job scripts from being removed
+running manager are unaffected. `--successful` reports nothing if
+`cleanup_successful_jobs` is false; `cleanup_failed_jobs` is ignored, so
+`--failed` always reports. To prevent job scripts from being removed
 automatically after submission (useful for debugging), set
 `keep_job_scripts: true` in the manager config.
 
 ### Restarting After an Error
 
-On startup, the manager recovers its jobs that are still in the SLURM queue,
-and those that finished in the last 7 days. Jobs that failed in that window
-are logged at WARNING with their reasons, including ones already reported
-before the restart, and do not count toward `max_consecutive_failed_cycles`.
+On startup, the manager recovers its jobs that are still in the SLURM queue;
+if `squeue` fails, it does not start. It then recovers its jobs that
+finished in the last 7 days from `sacct`, and logs one WARNING with the
+number that failed (including ones already reported before the restart),
+with each job and its reason at INFO. These do not count toward
+`max_consecutive_failed_cycles`. If `sacct` fails (e.g. accounting is
+disabled), it logs a WARNING and starts anyway.
 
 Fix the cause named in the manager log before restarting; if the manager is
 still in ERROR state on the server, clear it first (see

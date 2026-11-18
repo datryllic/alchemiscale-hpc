@@ -15,9 +15,12 @@ from ..base import (
 )
 from .settings import SlurmManagerSettings
 
-# SLURM job states considered "failed". sacct prints a cancelled job's state
-# as ``CANCELLED by <uid>``.
-SLURM_FAILED_STATES = "FAILED,TIMEOUT,CANCELLED,NODE_FAIL,PREEMPTED"
+# SLURM job states considered "failed": every terminal state in sacct's JOB
+# STATE CODES other than COMPLETED. sacct prints a cancelled job's state as
+# ``CANCELLED by <uid>``.
+SLURM_FAILED_STATES = (
+    "FAILED,TIMEOUT,CANCELLED,NODE_FAIL,PREEMPTED,OUT_OF_MEMORY,BOOT_FAIL,DEADLINE"
+)
 
 # Field separator for ``squeue``/``sacct`` parsable output. ``%j`` (job name)
 # is user-supplied and SLURM does not restrict commas, spaces, or pipes within
@@ -34,7 +37,7 @@ _SACCT_FORMAT = "JobID,State,JobName"
 _SQUEUE_TRACKED_FORMAT = f"%i{_FIELD_SEP}%T{_FIELD_SEP}%S{_FIELD_SEP}%j"
 
 # Format for failed jobs: ``ExitCode`` is ``<code>:<signal>``; ``Reason`` is
-# the last reason the job was held (``None`` if there was none). Neither
+# the last reason the job was pending (``None`` if there was none). Neither
 # contains ``|``, and the name stays last.
 _SACCT_FAILED_FORMAT = "JobID,State,ExitCode,Reason,JobName"
 
@@ -131,17 +134,20 @@ class SlurmBatchApi(HPCBatchApi):
                 )
         return unregistered
 
-    def clear_successful_jobs(self) -> None:
-        """Drop completed jobs from the in-memory tracking set.
+    def clear_successful_jobs(self) -> List[str]:
+        """Drop completed jobs from the in-memory tracking set, returning
+        their IDs.
 
         SLURM ``sacct`` records are immutable history, so there is nothing to
         delete on the cluster side; the manager simply forgets about jobs it
         no longer needs to monitor.
         """
         if not self.settings.cleanup_successful_jobs:
-            return
-        for job in self._get_completed_jobs():
-            self._untrack(job["job_id"])
+            return []
+        cleared = [job["job_id"] for job in self._get_completed_jobs()]
+        for job_id in cleared:
+            self._untrack(job_id)
+        return cleared
 
     def clear_failed_jobs(self) -> Dict[str, str]:
         """Drop failed jobs from the in-memory tracking set, returning
@@ -151,7 +157,9 @@ class SlurmBatchApi(HPCBatchApi):
         ``CANCELLED by 1000``), ``ExitCode``, and ``Reason``. Same caveat as
         :meth:`clear_successful_jobs`: this is purely in-memory; ``sacct``
         records are not modified. ``cleanup_failed_jobs`` is ignored, since a
-        failed job left tracked would be reported again every cycle.
+        failed job left tracked would be reported again every cycle. sacct's
+        ``Reason`` is the last reason the job was pending, so it is labeled
+        as such.
         """
         failed = {}
         for job in self._get_failed_jobs():
@@ -192,7 +200,14 @@ class SlurmBatchApi(HPCBatchApi):
     def submit_job(self, script_path: Path) -> str:
         """Submit a job script to SLURM and return the assigned job ID."""
         cmd = [self.settings.submit_command, str(script_path)]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as e:
+            # The exception's own message omits stderr, which says why.
+            raise RuntimeError(
+                f"{cmd[0]} exited with code {e.returncode}: "
+                f"{(e.stderr or '').strip()}"
+            ) from e
 
         # sbatch output: "Submitted batch job 12345"
         match = re.search(r"Submitted batch job (\d+)", result.stdout)
@@ -415,7 +430,8 @@ class SlurmBatchApi(HPCBatchApi):
         """Parse pipe-separated ``job_id|state|exit_code|reason|name`` lines.
 
         Each job gets a ``reason`` summarizing why it failed, e.g.
-        ``CANCELLED by 1000, exit code 0, signal 15``. As in
+        ``CANCELLED by 1000, exit code 0, signal 15``. sacct's ``Reason`` is
+        the last reason the job was pending, not why it failed. As in
         :meth:`_parse_jobs`, the name is last and may contain ``|``.
         """
         jobs: List[Dict[str, str]] = []
@@ -431,7 +447,7 @@ class SlurmBatchApi(HPCBatchApi):
             if signal and signal != "0":
                 details.append(f"signal {signal}")
             if reason and reason != "None":
-                details.append(f"reason {reason}")
+                details.append(f"last pending reason {reason}")
             jobs.append(
                 {
                     "job_id": job_id,
