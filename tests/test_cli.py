@@ -5,7 +5,9 @@ from unittest.mock import patch
 import pytest
 from click.testing import CliRunner
 
+from alchemiscale_hpc.base import make_job_name
 from alchemiscale_hpc.cli import _autoload_backends, cli
+from alchemiscale_hpc.slurm import SlurmBatchApi
 
 
 def test_top_level_help_lists_all_backends():
@@ -53,6 +55,60 @@ def test_lsf_show_jobs_stub_works():
     result = runner.invoke(cli, ["lsf", "show-jobs", "-c", "/tmp/x.yml"])
     assert result.exit_code == 1
     assert "not yet implemented" in result.output
+
+
+@pytest.fixture
+def slurm_config(tmp_path):
+    config = tmp_path / "manager.yml"
+    config.write_text(
+        "name: testmgr\n"
+        "logfile: null\n"
+        "max_compute_services: 1\n"
+        f"job_script_template: {tmp_path / 'job-template.sh'}\n"
+    )
+    return config
+
+
+def test_show_jobs_mine_shows_only_own_jobs(slurm_config):
+    own = make_job_name("testmgr")
+    other = make_job_name("testmgr.bar")
+    jobs = [
+        {"job_id": "1", "name": own, "state": "RUNNING"},
+        {"job_id": "2", "name": other, "state": "RUNNING"},
+    ]
+    runner = CliRunner()
+    args = ["slurm", "show-jobs", "-c", str(slurm_config)]
+    with patch.object(SlurmBatchApi, "get_jobs", return_value=jobs):
+        mine = runner.invoke(cli, args + ["--mine"])
+        everything = runner.invoke(cli, args)
+    assert mine.exit_code == 0, mine.output
+    assert own in mine.output and other not in mine.output
+    assert everything.exit_code == 0, everything.output
+    assert own in everything.output and other in everything.output
+
+
+def test_cleanup_recovers_jobs_before_clearing(slurm_config):
+    """The CLI process has no in-memory state, so cleanup first recovers the
+    manager's jobs, including recently finished ones."""
+
+    def recover(self, include_finished=False):
+        assert include_finished
+        self._track("7")
+        self._track("8")
+        return []
+
+    def clear_failed(self):
+        self._untrack("7")
+
+    runner = CliRunner()
+    with patch.object(SlurmBatchApi, "recover_jobs", recover), patch.object(
+        SlurmBatchApi, "clear_failed_jobs", clear_failed
+    ):
+        result = runner.invoke(
+            cli, ["slurm", "cleanup", "-c", str(slurm_config), "--failed"]
+        )
+    assert result.exit_code == 0, result.output
+    assert "Cleared 1 failed job(s): 7" in result.output
 
 
 def test_unknown_subcommand_fails_cleanly():

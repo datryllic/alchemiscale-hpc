@@ -96,6 +96,9 @@ View SLURM jobs:
 alchemiscale-hpc slurm show-jobs -c my-manager-config.yml
 ```
 
+Add `--mine` to show only the jobs submitted by the manager named in the
+config (job names `<name>.<uuid_hex>`).
+
 Or use standard SLURM commands:
 
 ```bash
@@ -135,8 +138,10 @@ Clear successful jobs from tracking:
 alchemiscale-hpc slurm cleanup -c my-manager-config.yml --successful
 ```
 
-Note: for SLURM, `cleanup` only updates the manager's in-memory tracking. It
-does not purge SLURM accounting (`sacct`) records or delete job scripts. (The
+`cleanup` finds the manager's jobs by name in `squeue` and, for jobs that
+finished in the last 7 days, in `sacct`, and reports which ones it cleared.
+
+Note: for SLURM, `cleanup` only updates in-memory tracking. It does not purge SLURM accounting (`sacct`) records or delete job scripts. (The
 same `cleanup` command on a Kubernetes-style backend would actually delete
 the corresponding Job objects.) To prevent job scripts from being removed
 automatically after submission (useful for debugging), set
@@ -197,7 +202,10 @@ automatically after submission (useful for debugging), set
    - Service registers with API
    - Claims and executes tasks
    - Deregisters when done (max tasks/time reached or no more tasks)
-6. **Manager tracks** job IDs and cleans up completed/failed jobs
+6. **Manager tracks** job IDs and cleans up completed/failed jobs. On
+   startup, it recovers its queued jobs from `squeue` by job name, so a
+   restarted manager does not submit on top of jobs that are still pending.
+   This is why `name` must be unique per cluster account
 
 ### Job Lifecycle
 

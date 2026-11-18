@@ -24,6 +24,7 @@ import re
 import tempfile
 import warnings
 from abc import ABC, abstractmethod
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set
@@ -293,6 +294,8 @@ class HPCBatchApi(ABC):
     * :meth:`jobs_pending` --- gate that lets the cycle skip submitting
       while prior submissions are still queueing
     * :meth:`submit_job` --- the actual submission
+    * :meth:`recover_jobs` --- rebuild ``tracked_jobs`` from the batch
+      system; called once at startup (and by ``cleanup``)
 
     **Operator/diagnostic primitives** (only invoked by the
     ``alchemiscale-hpc <backend> ...`` CLI; the autoscaling loop never
@@ -327,10 +330,14 @@ class HPCBatchApi(ABC):
     # mutating ``tracked_jobs`` directly so submission timestamps stay in sync)
     # ------------------------------------------------------------------
 
-    def _track(self, job_id: str) -> None:
-        """Record a newly-submitted job and stamp it with the current time."""
+    def _track(self, job_id: str, submitted: Optional[datetime] = None) -> None:
+        """Record a job and its submission time.
+
+        ``submitted`` defaults to now, as for a job just submitted. Jobs
+        recovered from the batch system pass their recorded submission time.
+        """
         self.tracked_jobs.add(job_id)
-        self._submission_times[job_id] = datetime.now(tz=timezone.utc)
+        self._submission_times[job_id] = submitted or datetime.now(tz=timezone.utc)
 
     def _untrack(self, job_id: str) -> None:
         """Forget a job (e.g. once it has completed or failed)."""
@@ -388,6 +395,35 @@ class HPCBatchApi(ABC):
     @abstractmethod
     def submit_job(self, script_path: Path) -> str:
         """Submit ``script_path`` to the batch system and return the job ID."""
+
+    @abstractmethod
+    def recover_jobs(self, include_finished: bool = False) -> List[Dict[str, str]]:
+        """Track this manager's jobs found in the batch system.
+
+        ``tracked_jobs`` is held in memory, so it is empty after a restart
+        and in each operator CLI invocation. This rebuilds it from the batch
+        system: every job of the current user whose name satisfies
+        :func:`is_own_job_name` for ``settings.name`` is tracked, with its
+        recorded submission time so that
+        ``job_registration_grace_period`` still applies. This relies on
+        manager names being unique per cluster account.
+
+        Called once by :meth:`HPCManager.start` before the first cycle, and by
+        the ``cleanup`` CLI command.
+
+        Parameters
+        ----------
+        include_finished
+            If False, recover only jobs still in the queue (pending, running,
+            ...). If True, also recover recently finished (completed or
+            failed) jobs; the lookback window is backend-defined.
+
+        Returns
+        -------
+        list of dict
+            The recovered jobs, each with at minimum ``job_id``, ``name``,
+            ``state``.
+        """
 
     # ------------------------------------------------------------------
     # Operator/diagnostic primitives
@@ -459,6 +495,23 @@ class HPCManager(ComputeManager, ABC):
     @abstractmethod
     def _create_batch_api(self) -> HPCBatchApi:
         """Construct and return the backend-specific :class:`HPCBatchApi`."""
+
+    def start(self, max_cycles: int | None = None, steal=False):
+        """Recover this manager's queued jobs, then run the main loop.
+
+        Without recovery, jobs submitted before a restart would be invisible
+        to the cycle: pending jobs would not stop it from submitting more,
+        and running jobs would not be checked for registration. Finished
+        jobs are not recovered; see :meth:`HPCBatchApi.recover_jobs`.
+        """
+        recovered = self.batch_api.recover_jobs()
+        counts = Counter(job["state"] for job in recovered)
+        summary = ", ".join(f"{n} {state}" for state, n in sorted(counts.items()))
+        self.logger.info(
+            f"Recovered {len(recovered)} job(s) from the batch system"
+            + (f" ({summary})" if summary else "")
+        )
+        super().start(max_cycles=max_cycles, steal=steal)
 
 
 class ScriptTemplateHPCManager(HPCManager):

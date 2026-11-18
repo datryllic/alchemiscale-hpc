@@ -1,15 +1,18 @@
 """SLURM-based compute manager for alchemiscale."""
 
+import os
 import re
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Set
+from typing import Dict, Iterable, List, Optional, Set
 
 from ..base import (
     HPCBatchApi,
     JobFailureError,
     JobNotFoundError,
     ScriptTemplateHPCManager,
+    is_own_job_name,
 )
 from .settings import SlurmManagerSettings
 
@@ -24,6 +27,22 @@ SLURM_FAILED_STATES = "FAILED,TIMEOUT,CANCELLED,NODE_FAIL,PREEMPTED"
 _FIELD_SEP = "|"
 _SQUEUE_FORMAT = f"%i{_FIELD_SEP}%T{_FIELD_SEP}%j"  # job_id, state, name
 _SACCT_FORMAT = "JobID,State,JobName"
+
+# Formats for ``recover_jobs``, which also needs each job's submission time
+# (squeue ``%V``, sacct ``Submit``). The name stays last.
+_SQUEUE_RECOVER_FORMAT = f"%i{_FIELD_SEP}%T{_FIELD_SEP}%V{_FIELD_SEP}%j"
+_SACCT_RECOVER_FORMAT = "JobID,State,Submit,JobName"
+
+# How far back ``recover_jobs(include_finished=True)`` looks for finished jobs
+# (sacct ``--starttime``). Only the operator CLI asks for finished jobs. A week
+# covers a manager that has been down over a weekend; older jobs are
+# accounting history rather than anything to act on, and a longer window makes
+# sacct scan more of the user's history.
+_FINISHED_LOOKBACK = "now-7days"
+
+# Have squeue/sacct print times as ISO 8601 (``YYYY-MM-DDTHH:MM:SS``, local
+# time), whatever SLURM_TIME_FORMAT the user has set.
+_SLURM_TIME_ENV = {"SLURM_TIME_FORMAT": "standard"}
 
 
 def _whoami() -> str:
@@ -165,6 +184,65 @@ class SlurmBatchApi(HPCBatchApi):
         self._track(job_id)
         return job_id
 
+    def recover_jobs(self, include_finished: bool = False) -> List[Dict[str, str]]:
+        """Track this manager's jobs found in SLURM.
+
+        Queued jobs come from ``squeue -u <user>``, in every state squeue
+        lists by default (pending, running, suspended, completing, ...). With
+        ``include_finished``, jobs that completed or failed within
+        ``_FINISHED_LOOKBACK`` also come from ``sacct``. That query is not
+        scoped with ``--jobs=``, so it needs an explicit time window.
+
+        Only jobs whose name satisfies :func:`is_own_job_name` for
+        ``settings.name`` are tracked, so manager ``foo`` does not claim a job
+        of manager ``foo.bar``. Submission times come from SLURM; if one
+        cannot be parsed, the job is stamped with the current time, which
+        grants it the full registration grace period rather than none.
+
+        Raises
+        ------
+        RuntimeError
+            If ``squeue`` or ``sacct`` fails. Proceeding without knowing which
+            jobs are ours would let the manager over-submit.
+        """
+        user = _whoami()
+        squeue_cmd = [
+            self.settings.query_command,
+            "-u",
+            user,
+            "-o",
+            _SQUEUE_RECOVER_FORMAT,
+            "--noheader",
+        ]
+        jobs = self._parse_jobs_with_submit(self._run_query(squeue_cmd))
+
+        if include_finished:
+            sacct_cmd = [
+                self.settings.accounting_command,
+                "-u",
+                user,
+                "-S",
+                _FINISHED_LOOKBACK,
+                "-E",
+                "now",
+                "-s",
+                f"COMPLETED,{SLURM_FAILED_STATES}",
+                "-o",
+                _SACCT_RECOVER_FORMAT,
+                "--noheader",
+                "-X",  # only show main job, not steps
+                "-P",  # parsable output: pipe-separated, no padding
+            ]
+            jobs += self._parse_jobs_with_submit(self._run_query(sacct_cmd))
+
+        recovered = []
+        for job in jobs:
+            if not is_own_job_name(self.settings.name, job["name"]):
+                continue
+            self._track(job["job_id"], _parse_submit_time(job.pop("submitted")))
+            recovered.append(job)
+        return recovered
+
     # ------------------------------------------------------------------
     # internal helpers
     # ------------------------------------------------------------------
@@ -241,6 +319,48 @@ class SlurmBatchApi(HPCBatchApi):
         return self._parse_jobs(result.stdout)
 
     @staticmethod
+    def _run_query(cmd: List[str]) -> str:
+        """Run a user-scoped SLURM query and return its stdout.
+
+        Unlike the ``--jobs=``-scoped queries, where a non-zero exit can just
+        mean the listed jobs have left the queue, a query scoped to the user
+        that exits non-zero has failed.
+        """
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env={**os.environ, **_SLURM_TIME_ENV},
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"{cmd[0]} exited with code {result.returncode}: "
+                f"{result.stderr.strip()}"
+            )
+        return result.stdout
+
+    @staticmethod
+    def _parse_jobs_with_submit(text: str) -> List[Dict[str, str]]:
+        """Parse pipe-separated ``job_id|state|submitted|name`` lines.
+
+        As in :meth:`_parse_jobs`, the name is last and may contain ``|``.
+        """
+        jobs: List[Dict[str, str]] = []
+        for line in text.strip().splitlines():
+            parts = line.split(_FIELD_SEP, 3)
+            if len(parts) == 4:
+                job_id, state, submitted, name = parts
+                jobs.append(
+                    {
+                        "job_id": job_id,
+                        "state": state,
+                        "submitted": submitted,
+                        "name": name,
+                    }
+                )
+        return jobs
+
+    @staticmethod
     def _parse_jobs(text: str) -> List[Dict[str, str]]:
         """Parse pipe-separated ``job_id|state|name`` lines.
 
@@ -256,6 +376,19 @@ class SlurmBatchApi(HPCBatchApi):
             if len(parts) >= 3:
                 jobs.append({"job_id": parts[0], "state": parts[1], "name": parts[2]})
         return jobs
+
+
+def _parse_submit_time(value: str) -> Optional[datetime]:
+    """Parse a SLURM submit time (``YYYY-MM-DDTHH:MM:SS``, local) as UTC.
+
+    Returns None for values that are not timestamps (e.g. ``Unknown``).
+    """
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    # A naive datetime is taken as local time, which is what SLURM prints.
+    return parsed.astimezone(timezone.utc)
 
 
 class SlurmManager(ScriptTemplateHPCManager):

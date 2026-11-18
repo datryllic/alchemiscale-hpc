@@ -99,12 +99,19 @@ def _build_backend_group(backend: str) -> click.Group:
         help=f"Show all {backend.upper()} jobs in the queue for the current user.",
     )
     @config_option
-    def show_jobs(config_file: Path) -> None:
+    @click.option(
+        "--mine",
+        is_flag=True,
+        help="Show only jobs submitted by the manager named in the config.",
+    )
+    def show_jobs(config_file: Path, mine: bool) -> None:
         _, _, batch_api_cls = _base.get_backend(backend)
         settings = _load_settings(config_file, backend)
         batch_api = batch_api_cls(settings)
 
         jobs = batch_api.get_jobs()
+        if mine:
+            jobs = [j for j in jobs if _base.is_own_job_name(settings.name, j["name"])]
         if not jobs:
             click.echo(f"No jobs found in {backend.upper()} queue")
             return
@@ -135,16 +142,25 @@ def _build_backend_group(backend: str) -> click.Group:
         _, _, batch_api_cls = _base.get_backend(backend)
         settings = _load_settings(config_file, backend)
         batch_api = batch_api_cls(settings)
+        # This process has no in-memory state; find the manager's jobs,
+        # including recently finished ones, in the batch system.
+        batch_api.recover_jobs(include_finished=True)
+
+        def _clear(kind: str, clear) -> None:
+            click.echo(f"Clearing {kind} jobs...")
+            before = set(batch_api.tracked_jobs)
+            clear()
+            cleared = sorted(before - batch_api.tracked_jobs)
+            click.echo(
+                f"Cleared {len(cleared)} {kind} job(s)"
+                + (f": {', '.join(cleared)}" if cleared else "")
+            )
 
         if failed:
-            click.echo("Clearing failed jobs...")
-            batch_api.clear_failed_jobs()
-            click.echo("Done")
+            _clear("failed", batch_api.clear_failed_jobs)
 
         if successful:
-            click.echo("Clearing successful jobs...")
-            batch_api.clear_successful_jobs()
-            click.echo("Done")
+            _clear("successful", batch_api.clear_successful_jobs)
 
     return group
 
