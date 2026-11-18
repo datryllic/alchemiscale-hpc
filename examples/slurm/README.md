@@ -143,7 +143,16 @@ failed jobs are found in more than `max_consecutive_failed_cycles` (default
 completing, or one of its compute services registered with the server.
 Checks that only see pending jobs neither count nor reset. So routine
 preemptions and timeouts in a working fleet never stop the manager, while
-jobs that fail without ever registering do, even if they pend first.
+jobs that fail without ever registering do, even if they pend first. After
+a change that breaks the template, an older service of this manager that is
+still registered keeps resetting the count until it ends (up to its
+walltime); only then does the limit apply. The new jobs' failures are
+logged at ERROR throughout.
+
+Your job script must exit with the compute service's exit status, as the
+example template does: a job that exits 0 is recorded as `COMPLETED`, which
+counts as a sign of health, so a service that never started would otherwise
+keep the manager resubmitting.
 
 Likewise, it stops with `JobSubmissionError` if every `sbatch` fails in more
 than that many cycles while none of its compute services is registered;

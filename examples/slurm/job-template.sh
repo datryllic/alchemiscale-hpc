@@ -68,7 +68,13 @@ alchemiscale compute synchronous \
     -c "$SERVICE_CONFIG" \
     --name "{{ JOB_NAME }}" \
     --compute-manager-id "{{ COMPUTE_MANAGER_ID }}"
+# Capture the service's exit status right away. The job must exit with it:
+# SLURM records a job that exits 0 as COMPLETED, which the manager takes as
+# a sign of health, so a service that failed to start (command not found,
+# wrong environment, bad service config) must not end the job with status 0.
+status=$?
 
 # Job completion
 echo "End Time: $(date)"
-echo "Job completed successfully"
+echo "Compute service exited with status $status"
+exit $status
