@@ -670,3 +670,74 @@ def test_generate_job_name_format(slurm_settings: SlurmManagerSettings, tmp_path
     assert re.fullmatch(r"[0-9a-f]{32}", suffix), suffix
     # Each call yields a fresh uuid.
     assert name != mgr._generate_job_name()
+
+
+# ----------------------------------------------------------------------
+# Job script template validation
+# ----------------------------------------------------------------------
+
+EXAMPLE_TEMPLATE = (
+    Path(__file__).resolve().parent.parent / "examples" / "slurm" / "job-template.sh"
+)
+
+
+@pytest.mark.parametrize("missing", ["JOB_NAME", "COMPUTE_MANAGER_ID"])
+def test_template_missing_required_placeholder_raises(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, missing: str
+):
+    """A template without a required placeholder is rejected at construction."""
+    template = slurm_settings.job_script_template
+    template.write_text(template.read_text().replace(f"{{{{ {missing} }}}}", "x"))
+
+    with pytest.raises(ValueError, match=f"missing required placeholder.*{missing}"):
+        _build_manager(slurm_settings, tmp_path)
+
+
+def test_template_unknown_placeholder_warns(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, caplog
+):
+    """Unknown or mis-spaced ``{{ ... }}`` tokens are logged as warnings."""
+    template = slurm_settings.job_script_template
+    template.write_text(template.read_text() + "{{ PARITION }}\necho {{JOB_NAME}}\n")
+
+    with caplog.at_level("WARNING"):
+        _build_manager(slurm_settings, tmp_path)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 2
+    assert any("{{ PARITION }}" in w for w in warnings)
+    assert any("{{JOB_NAME}}" in w for w in warnings)
+
+
+def test_example_template_validates_cleanly(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, caplog
+):
+    """The bundled example template passes validation without warnings and
+    renders with no placeholders left over."""
+    settings = slurm_settings.model_copy(
+        update={"job_script_template": EXAMPLE_TEMPLATE}
+    )
+
+    with caplog.at_level("WARNING"):
+        mgr = _build_manager(settings, tmp_path)
+
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    script_path = mgr._create_job_script()
+    try:
+        assert "{{" not in script_path.read_text()
+    finally:
+        script_path.unlink(missing_ok=True)
+
+
+def test_render_template_rejects_undeclared_substitutions(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """Substitution keys must match ``TEMPLATE_PLACEHOLDERS`` exactly."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    substitutions = dict.fromkeys(SlurmManager.TEMPLATE_PLACEHOLDERS, "")
+
+    with pytest.raises(ValueError, match="TEMPLATE_PLACEHOLDERS"):
+        mgr._render_template({**substitutions, "EXTRA": ""})
+    with pytest.raises(ValueError, match="TEMPLATE_PLACEHOLDERS"):
+        mgr._render_template({k: v for k, v in substitutions.items() if k != "QOS"})

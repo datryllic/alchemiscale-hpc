@@ -268,6 +268,12 @@ class SlurmManager(ScriptTemplateHPCManager):
     settings: SlurmManagerSettings
     batch_api: SlurmBatchApi
 
+    TEMPLATE_PLACEHOLDERS = ScriptTemplateHPCManager.REQUIRED_TEMPLATE_PLACEHOLDERS | {
+        "PARTITION",
+        "ACCOUNT",
+        "QOS",
+    }
+
     def _create_batch_api(self) -> SlurmBatchApi:
         return SlurmBatchApi(self.settings)
 

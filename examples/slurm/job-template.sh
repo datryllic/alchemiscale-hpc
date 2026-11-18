@@ -13,14 +13,18 @@
 #SBATCH --error=logs/alchemiscale-%j.err
 
 # This is a template SLURM job script for alchemiscale compute services.
-# The manager will replace {{ VARIABLE }} placeholders with actual values.
+# The manager will replace the placeholders listed below with actual values.
+# It warns at startup about any other double-brace token, which would be left
+# in the script unchanged.
 #
-# Required placeholders:
+# Required placeholders (the manager refuses to start without them):
 #   {{ JOB_NAME }}            - Unique job name (auto-generated)
-#   {{ PARTITION }}           - SLURM partition directive (optional, can be empty)
-#   {{ ACCOUNT }}             - SLURM account directive (optional, can be empty)
-#   {{ QOS }}                 - SLURM QOS directive (optional, can be empty)
 #   {{ COMPUTE_MANAGER_ID }}  - Manager ID for provenance tracking
+#
+# Optional placeholders:
+#   {{ PARTITION }}           - SLURM partition directive (can be empty)
+#   {{ ACCOUNT }}             - SLURM account directive (can be empty)
+#   {{ QOS }}                 - SLURM QOS directive (can be empty)
 #
 # Customize the resource requests above (#SBATCH directives) for your HPC system.
 
