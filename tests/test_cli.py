@@ -89,7 +89,7 @@ def test_show_jobs_mine_shows_only_own_jobs(slurm_config):
     assert own in everything.output and other in everything.output
 
 
-def test_cleanup_recovers_jobs_before_clearing(slurm_config):
+def test_cleanup_recovers_jobs_before_reporting(slurm_config):
     """The CLI process has no in-memory state, so cleanup first recovers the
     manager's jobs, including recently finished ones."""
 
@@ -100,7 +100,9 @@ def test_cleanup_recovers_jobs_before_clearing(slurm_config):
         return []
 
     def clear_failed(self):
+        assert self.tracked_jobs == {"7", "8"}
         self._untrack("7")
+        return {"7": "TIMEOUT, exit code 0"}
 
     runner = CliRunner()
     with patch.object(SlurmBatchApi, "recover_jobs", recover), patch.object(
@@ -110,13 +112,18 @@ def test_cleanup_recovers_jobs_before_clearing(slurm_config):
             cli, ["slurm", "cleanup", "-c", str(slurm_config), "--failed"]
         )
     assert result.exit_code == 0, result.output
-    assert "Found 1 failed job(s) of manager 'testmgr': 7" in result.output
+    assert result.output.splitlines()[:2] == [
+        "Found 1 failed job(s) of manager 'testmgr':",
+        "  7: TIMEOUT, exit code 0",
+    ]
     assert "SLURM records are unchanged" in result.output
+    assert "it logs each failed job, with its reason" in result.output
 
 
 def test_cleanup_finds_failed_jobs_through_slurm(slurm_config):
-    """End to end through squeue/sacct: cleanup finds this manager's failed
-    job, and not another manager's, without any in-memory state."""
+    """End to end through squeue/sacct: cleanup reports this manager's failed
+    job with its reason, and not another manager's, without any in-memory
+    state."""
     own = [make_job_name("testmgr") for _ in range(3)]
     other = make_job_name("testmgr.bar")
     ts = "2026-11-18T09:30:00"
@@ -127,7 +134,7 @@ def test_cleanup_finds_failed_jobs_through_slurm(slurm_config):
             f"8|COMPLETED|{ts}|{own[2]}\n"
             f"9|FAILED|{ts}|{other}\n"
         ),
-        sacct_tracked=f"7|FAILED|{own[1]}\n",
+        sacct_tracked=f"7|CANCELLED by 1000|0:15|None|{own[1]}\n",
     )
     runner = CliRunner()
     with patch("subprocess.run", side_effect=run), patch(
@@ -137,13 +144,50 @@ def test_cleanup_finds_failed_jobs_through_slurm(slurm_config):
             cli, ["slurm", "cleanup", "-c", str(slurm_config), "--failed"]
         )
     assert result.exit_code == 0, result.output
-    assert "Found 1 failed job(s) of manager 'testmgr': 7" in result.output
+    assert "Found 1 failed job(s) of manager 'testmgr':" in result.output
+    assert "  7: CANCELLED by 1000, exit code 0, signal 15" in result.output
     # The failed-job query is scoped to this manager's recovered jobs only.
     [scoped] = [c for c in calls if any(a.startswith("--jobs=") for a in c)]
     assert "--jobs=5,7,8" in scoped
 
 
-def test_cleanup_respects_disabled_setting(slurm_config):
+def test_cleanup_successful_respects_disabled_setting(slurm_config):
+    slurm_config.write_text(
+        slurm_config.read_text() + "cleanup_successful_jobs: false\n"
+    )
+    runner = CliRunner()
+    with patch.object(SlurmBatchApi, "recover_jobs", return_value=[]):
+        result = runner.invoke(
+            cli, ["slurm", "cleanup", "-c", str(slurm_config), "--successful"]
+        )
+    assert result.exit_code == 0, result.output
+    assert "Skipping successful jobs: cleanup_successful_jobs is false" in (
+        result.output
+    )
+    assert "Found" not in result.output
+
+
+def test_cleanup_reports_successful_jobs(slurm_config):
+    def recover(self, include_finished=False):
+        self._track("7")
+        self._track("8")
+        return []
+
+    runner = CliRunner()
+    with patch.object(SlurmBatchApi, "recover_jobs", recover), patch.object(
+        SlurmBatchApi,
+        "_get_completed_jobs",
+        return_value=[{"job_id": "8", "state": "COMPLETED", "name": "x"}],
+    ):
+        result = runner.invoke(
+            cli, ["slurm", "cleanup", "-c", str(slurm_config), "--successful"]
+        )
+    assert result.exit_code == 0, result.output
+    assert "Found 1 successful job(s) of manager 'testmgr': 8" in result.output
+
+
+def test_cleanup_failed_ignores_disabled_setting(slurm_config):
+    """``cleanup_failed_jobs`` does not apply to SLURM; the report still runs."""
     slurm_config.write_text(
         slurm_config.read_text() + "cleanup_failed_jobs: false\n"
     )
@@ -153,8 +197,7 @@ def test_cleanup_respects_disabled_setting(slurm_config):
             cli, ["slurm", "cleanup", "-c", str(slurm_config), "--failed"]
         )
     assert result.exit_code == 0, result.output
-    assert "Skipping failed jobs: cleanup_failed_jobs is false" in result.output
-    assert "Found" not in result.output
+    assert "Found 0 failed job(s) of manager 'testmgr'" in result.output
 
 
 def test_unknown_subcommand_fails_cleanly():

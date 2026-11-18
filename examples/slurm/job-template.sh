@@ -54,7 +54,7 @@ SERVICE_CONFIG="/path/to/compute-service-settings.yaml"
 #
 # `--name "{{ JOB_NAME }}"` overrides the `name` field in the service config so
 # that the registered ComputeServiceID matches the SLURM job name. This is
-# REQUIRED for the manager's `verify_running_jobs` health check to work.
+# REQUIRED for the manager's check that running jobs are registered.
 #
 # `--compute-manager-id "{{ COMPUTE_MANAGER_ID }}"` records the manager that
 # launched this service for provenance.

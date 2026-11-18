@@ -79,7 +79,8 @@ The manager will:
 1. Register with the alchemiscale compute API
 2. Periodically check for available tasks
 3. Submit SLURM jobs when tasks are waiting and capacity is available
-4. Monitor job health and cleanup completed/failed jobs
+4. Log failed jobs with their reasons, and stop tracking completed and
+   failed jobs
 5. Report status back to the server
 
 ### 5. Monitor the Manager
@@ -124,15 +125,37 @@ alchemiscale-hpc slurm clear-error \
     -s my-service-config.yml
 ```
 
-### Cleanup Jobs
+### Failed Jobs
 
-List the manager's failed jobs:
+A failed job (`FAILED`, `TIMEOUT`, `CANCELLED`, `NODE_FAIL`, `PREEMPTED`)
+does not stop the manager. Each cycle that checks its jobs, the manager logs
+every newly failed job at ERROR with its `sacct` state, exit code, and
+reason, for example:
+
+```
+Batch job 4242 failed: CANCELLED by 1000, exit code 0, signal 15
+```
+
+and stops tracking it. The manager stops with `JobFailureError` only if
+failed jobs are found in more than `max_consecutive_failed_cycles` (default
+5) consecutive checks, and with `JobSubmissionError` if every `sbatch` fails
+in more than that many consecutive cycles that submit. Either usually means
+a broken job script template or settings (partition, account, QoS).
+
+A running job that is not registered with the server, past
+`job_registration_grace_period` from when it started, is logged at WARNING
+and checked again next cycle: a job can stay RUNNING briefly after its
+compute service deregisters. The manager stops with `JobNotFoundError` only
+if the job is still unregistered on a later check at least
+`job_registration_grace_period` seconds after it was first found.
+
+To list the manager's recently failed jobs, with their reasons:
 
 ```bash
 alchemiscale-hpc slurm cleanup -c my-manager-config.yml --failed
 ```
 
-List the manager's successful jobs:
+To list its recently successful jobs:
 
 ```bash
 alchemiscale-hpc slurm cleanup -c my-manager-config.yml --successful
@@ -140,21 +163,26 @@ alchemiscale-hpc slurm cleanup -c my-manager-config.yml --successful
 
 `cleanup` finds the manager's jobs by name in `squeue` and, for jobs that
 finished in the last 7 days, in `sacct`, and reports the failed or successful
-ones. For SLURM, this is all it does: it clears them only from its own
-in-memory tracking, so SLURM accounting (`sacct`) records, job scripts, and a
-running manager are unaffected. A manager forgets finished jobs when it
-restarts. (The same `cleanup` command on a Kubernetes-style backend would
-actually delete the corresponding Job objects.) To prevent job scripts from
-being removed automatically after submission (useful for debugging), set
+ones. It only reads SLURM: accounting (`sacct`) records, job scripts, and a
+running manager are unaffected. To prevent job scripts from being removed
+automatically after submission (useful for debugging), set
 `keep_job_scripts: true` in the manager config.
 
 ### Restarting After an Error
 
 On startup, the manager recovers its jobs that are still in the SLURM queue,
-with their original submission times. Restarting therefore does not clear a
-halt caused by a running job that never registered with the server
-(`JobNotFoundError`): the first cycle finds the same job and halts again,
-until the job ends or you cancel it with `scancel`.
+and those that finished in the last 7 days. Jobs that failed in that window
+are logged at WARNING with their reasons, including ones already reported
+before the restart, and do not count toward `max_consecutive_failed_cycles`.
+
+Fix the cause named in the manager log before restarting; if the manager is
+still in ERROR state on the server, clear it first (see
+[Clear Error Status](#clear-error-status)).
+
+A restart does not forget a running job that is not registered with the
+server: it is recovered and, after a check and a re-check, stops the manager
+with `JobNotFoundError` again, until the job ends or you cancel it with
+`scancel`.
 
 ## How It Works
 
@@ -211,10 +239,11 @@ until the job ends or you cancel it with `scancel`.
    - Service registers with API
    - Claims and executes tasks
    - Deregisters when done (max tasks/time reached or no more tasks)
-6. **Manager tracks** job IDs and cleans up completed/failed jobs. On
-   startup, it recovers its queued jobs from `squeue` by job name, so a
-   restarted manager does not submit on top of jobs that are still pending.
-   This is why `name` must be unique per cluster account.
+6. **Manager tracks** job IDs, logs failed jobs with their reasons, and
+   stops tracking completed and failed jobs. On startup, it recovers its jobs
+   from `squeue` and `sacct` by job name, so a restarted manager does not
+   submit on top of jobs that are still pending. This is why `name` must be
+   unique per cluster account.
 
 ### Job Lifecycle
 
@@ -227,7 +256,9 @@ until the job ends or you cancel it with `scancel`.
 - **PENDING**: Job is queued in SLURM, waiting for resources
 - **RUNNING**: Job is executing, compute service is active
 - **COMPLETED**: Job finished successfully, service deregistered
-- **FAILED**: Job failed, manager raises alert
+- **FAILED** (or `TIMEOUT`, `CANCELLED`, `NODE_FAIL`, `PREEMPTED`): manager
+  logs the reason and carries on; it stops only if jobs fail cycle after cycle
+  (see [Failed Jobs](#failed-jobs))
 
 ## Troubleshooting
 

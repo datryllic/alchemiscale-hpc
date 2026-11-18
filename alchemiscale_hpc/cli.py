@@ -124,18 +124,20 @@ def _build_backend_group(backend: str) -> click.Group:
     @group.command(
         name="cleanup",
         help=(
-            f"Find this manager's successful and/or failed {backend.upper()} "
-            "jobs and clear them from tracking."
+            f"Report this manager's recently finished failed and/or "
+            f"successful {backend.upper()} jobs."
         ),
     )
     @config_option
-    @click.option("--failed", is_flag=True, help="Clear failed jobs.")
+    @click.option(
+        "--failed", is_flag=True, help="Report failed jobs, with their reasons."
+    )
     @click.option(
         "--successful",
         "--completed",
         "successful",
         is_flag=True,
-        help="Clear successful jobs.",
+        help="Report successful jobs.",
     )
     def cleanup(config_file: Path, failed: bool, successful: bool) -> None:
         if not failed and not successful:
@@ -149,32 +151,33 @@ def _build_backend_group(backend: str) -> click.Group:
         # including recently finished ones, in the batch system.
         batch_api.recover_jobs(include_finished=True)
 
-        def _clear(kind: str, setting: str, clear) -> None:
-            if not getattr(settings, setting, True):
-                click.echo(f"Skipping {kind} jobs: {setting} is false in the config")
-                return
+        if failed:
+            reasons = batch_api.clear_failed_jobs()
+            click.echo(
+                f"Found {len(reasons)} failed job(s) of manager {settings.name!r}"
+                + (":" if reasons else "")
+            )
+            for job_id, reason in reasons.items():
+                click.echo(f"  {job_id}: {reason}")
+
+        if successful and not getattr(settings, "cleanup_successful_jobs", True):
+            click.echo(
+                "Skipping successful jobs: cleanup_successful_jobs is false in "
+                "the config"
+            )
+        elif successful:
             before = set(batch_api.tracked_jobs)
-            clear()
+            batch_api.clear_successful_jobs()
             found = sorted(before - batch_api.tracked_jobs)
             click.echo(
-                f"Found {len(found)} {kind} job(s) of manager {settings.name!r}"
+                f"Found {len(found)} successful job(s) of manager {settings.name!r}"
                 + (f": {', '.join(found)}" if found else "")
             )
 
-        if failed:
-            _clear("failed", "cleanup_failed_jobs", batch_api.clear_failed_jobs)
-
-        if successful:
-            _clear(
-                "successful",
-                "cleanup_successful_jobs",
-                batch_api.clear_successful_jobs,
-            )
-
-        # Clearing only affects this process's tracking; say so plainly.
+        # This only reads the batch system; say so plainly.
         click.echo(
             f"{backend.upper()} records are unchanged, and a running manager is "
-            "unaffected; a manager forgets finished jobs when it restarts."
+            "unaffected; it logs each failed job, with its reason, as it finds it."
         )
 
     return group

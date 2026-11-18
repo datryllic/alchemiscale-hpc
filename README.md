@@ -73,7 +73,7 @@ alchemiscale-hpc slurm clear-error -c manager-config.yml -s service-config.yml
 # Show SLURM jobs
 alchemiscale-hpc slurm show-jobs -c manager-config.yml
 
-# Cleanup completed/failed jobs
+# Report the manager's recently failed (with reasons) and completed jobs
 alchemiscale-hpc slurm cleanup -c manager-config.yml --failed --completed
 ```
 
@@ -117,10 +117,13 @@ The package uses a modular architecture with two abstraction layers:
    - `HPCManager`: minimal manager contract (`_create_batch_api`,
      `create_compute_services`). Extends alchemiscale's `ComputeManager`.
    - `HPCBatchApi`: abstract interface for batch system commands
-     (`submit_job`, `get_jobs`, `check_job_health`,
+     (`submit_job`, `get_jobs`, `find_unregistered_jobs`,
      `clear_successful_jobs`, `clear_failed_jobs`, ...). `recover_jobs`
      rebuilds the manager's job tracking from the batch system by job name
-     at startup, so ownership survives restarts.
+     at startup, so ownership survives restarts. `HPCManager` logs and
+     untracks failed jobs every cycle, and stops only when jobs fail, or
+     every submission fails, in more than `max_consecutive_failed_cycles`
+     consecutive cycles.
    - `HPCManagerSettings`: settings every backend needs (`name`,
      `max_submit_per_cycle`, ...). Job names are built as
      `<name>.<uuid_hex>`, so `name` is validated against alchemiscale's

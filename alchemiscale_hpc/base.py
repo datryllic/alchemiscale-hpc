@@ -27,7 +27,7 @@ from abc import ABC, abstractmethod
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 from uuid import uuid4
 
 import yaml
@@ -120,7 +120,11 @@ class JobNotFoundError(Exception):
 
 
 class JobFailureError(Exception):
-    """Raised when a batch job has failed."""
+    """Raised when batch jobs keep failing, cycle after cycle."""
+
+
+class JobSubmissionError(Exception):
+    """Raised when batch job submission keeps failing, cycle after cycle."""
 
 
 class HPCManagerSettings(ComputeManagerSettings):
@@ -134,6 +138,33 @@ class HPCManagerSettings(ComputeManagerSettings):
     Batch jobs are named ``{name}.{uuid_hex}``, so the manager's ``name``
     identifies the jobs it submits.
     """
+
+    job_registration_grace_period: int = Field(
+        120,
+        description=(
+            "Seconds a job may run without being registered with the server. "
+            "Between the batch system starting a job and its compute service "
+            "finishing its registration handshake, the job is running but not "
+            "yet known to the server; the same happens at the end of a job, "
+            "between the service deregistering and the job leaving the "
+            "running state. Measured from when the job started running, not "
+            "from submission. Bumping this value avoids spurious "
+            "JobNotFoundError on busy clusters; lowering it makes the manager "
+            "catch real registration failures faster. Default 120 seconds."
+        ),
+    )
+    max_consecutive_failed_cycles: int | None = Field(
+        5,
+        ge=0,
+        description=(
+            "Failed batch jobs are logged with their reason and untracked "
+            "whenever the manager checks its jobs; stop with JobFailureError if "
+            "they are found in more than this many consecutive checks. "
+            "Likewise, stop with JobSubmissionError if every job submission "
+            "fails in more than this many consecutive cycles that submit. 0 "
+            "stops on the first failure; null never stops."
+        ),
+    )
 
     # Warning emitted because the config set the deprecated
     # ``job_name_prefix`` (to any value, including null), so the manager can
@@ -251,21 +282,11 @@ class ScriptTemplateHPCManagerSettings(HPCManagerSettings):
     cleanup_failed_jobs: bool = Field(
         True,
         description=(
-            "If True, ``clear_failed_jobs`` is enabled. Same backend-specific "
-            "semantics as ``cleanup_successful_jobs``."
-        ),
-    )
-    job_registration_grace_period: int = Field(
-        120,
-        description=(
-            "Seconds to wait after submitting a job before treating it as "
-            "'should be registered with the server'. Between SLURM "
-            "transitioning a job to RUNNING and the compute service finishing "
-            "its registration handshake there is a brief window during which "
-            "the job is running but not yet known to the server. Bumping this "
-            "value avoids spurious JobNotFoundError on busy clusters; lowering "
-            "it makes the manager catch real registration failures faster. "
-            "Default 120 seconds."
+            "Reserved for backends where clearing a failed job deletes it from "
+            "the batch system (Kubernetes-style), where False would keep it for "
+            "inspection. The SLURM backend ignores it: failed jobs are always "
+            "logged once and dropped from in-memory tracking, and their "
+            "``sacct`` records are kept regardless."
         ),
     )
 
@@ -285,8 +306,9 @@ class HPCBatchApi(ABC):
     :meth:`ScriptTemplateHPCManager.create_compute_services`; correctness
     of autoscaling depends on these):
 
-    * :meth:`check_job_health` --- raise on tracked-job failure
-    * :meth:`verify_running_jobs` --- sanity-check running jobs are
+    * :meth:`clear_failed_jobs` --- untrack failed jobs and report why
+      they failed
+    * :meth:`find_unregistered_jobs` --- find running jobs that are not
       registered with the alchemiscale server
     * :meth:`clear_successful_jobs` --- per-cycle cleanup of finished jobs
       (backend-defined: in-memory for SLURM-style, real deletion for
@@ -302,12 +324,11 @@ class HPCBatchApi(ABC):
     calls these):
 
     * :meth:`get_jobs` --- backs ``show-jobs``
-    * :meth:`clear_failed_jobs` --- backs ``cleanup --failed``
 
     The split reflects intent, not optionality. The CLI is part of the
     operator interface for any production deployment, so a backend that
-    leaves ``get_jobs`` or ``clear_failed_jobs`` as no-ops is shipping a
-    half-finished operator experience.
+    leaves ``get_jobs`` as a no-op is shipping a half-finished operator
+    experience.
     """
 
     def __init__(self, settings: HPCManagerSettings):
@@ -321,8 +342,9 @@ class HPCBatchApi(ABC):
         self.settings = settings
         self.tracked_jobs: Set[str] = set()
         # Submission timestamps for tracked jobs; populated by ``_track`` and
-        # consumed by ``_job_age``. Used to grant newly-submitted jobs a grace
-        # period before health checks treat them as "should be registered".
+        # consumed by ``_job_age``. The registration grace period runs from
+        # when a job started; backends fall back to its submission time when
+        # the start time is unknown.
         self._submission_times: Dict[str, datetime] = {}
 
     # ------------------------------------------------------------------
@@ -358,22 +380,38 @@ class HPCBatchApi(ABC):
     # Correctness of autoscaling depends on these.
 
     @abstractmethod
-    def check_job_health(self) -> None:
-        """Raise :class:`JobFailureError` if any tracked job has failed."""
+    def clear_failed_jobs(self) -> Dict[str, str]:
+        """Stop tracking failed jobs, returning ``{job_id: failure reason}``.
+
+        Each failed job is returned once: it is untracked, so later calls do
+        not report it again. Called every cycle by
+        :meth:`HPCManager.handle_failed_jobs`, which logs the reasons and
+        decides whether to stop, and once at startup for jobs recovered by
+        :meth:`recover_jobs`. Also backs ``cleanup --failed``. For
+        Kubernetes-style backends, clearing would also delete the job from
+        the batch system.
+        """
 
     @abstractmethod
-    def verify_running_jobs(self, server_job_names: Set[str]) -> None:
-        """Verify that all running jobs are registered with the server.
+    def find_unregistered_jobs(
+        self, server_job_names: Set[str]
+    ) -> List[Dict[str, str]]:
+        """Return tracked running jobs that are not registered with the server.
+
+        Jobs that started running less than ``job_registration_grace_period``
+        seconds ago are left out, since their compute service may still be
+        registering. Whether an unregistered job is an error is decided by
+        :meth:`HPCManager.handle_unregistered_jobs`.
 
         Parameters
         ----------
         server_job_names
             Set of job names reported by the alchemiscale server.
 
-        Raises
-        ------
-        JobNotFoundError
-            If a running job is not registered with the server.
+        Returns
+        -------
+        list of dict
+            Each dict contains at minimum ``job_id``, ``name``, ``state``.
         """
 
     @abstractmethod
@@ -409,7 +447,7 @@ class HPCBatchApi(ABC):
         manager names being unique per cluster account.
 
         Called once by :meth:`HPCManager.start` before the first cycle, and by
-        the ``cleanup`` CLI command.
+        the ``cleanup`` CLI command, both with ``include_finished=True``.
 
         Parameters
         ----------
@@ -440,16 +478,6 @@ class HPCBatchApi(ABC):
         -------
         list of dict
             Each dict contains at minimum ``job_id``, ``name``, ``state``.
-        """
-
-    @abstractmethod
-    def clear_failed_jobs(self) -> None:
-        """Operator-driven cleanup hook for failed jobs. Backs
-        ``alchemiscale-hpc <backend> cleanup --failed``.
-
-        Mirrors :meth:`clear_successful_jobs` but for failed jobs. Not called
-        on every cycle; only reached after an operator has investigated a
-        failure and asked to clear the wreckage.
         """
 
 
@@ -492,25 +520,35 @@ class HPCManager(ComputeManager, ABC):
         # Subclasses provide the concrete batch API via _create_batch_api().
         self.batch_api: HPCBatchApi = self._create_batch_api()
 
+        # Consecutive checks that found failed jobs; see handle_failed_jobs.
+        self.consecutive_failed_cycles = 0
+        # Consecutive submitting cycles in which every submission failed.
+        self.consecutive_failed_submission_cycles = 0
+        # Running jobs found unregistered on the last check, as
+        # ``{job_id: (first found, consecutive checks)}``; see
+        # handle_unregistered_jobs.
+        self._unregistered_jobs: Dict[str, Tuple[datetime, int]] = {}
+
     @abstractmethod
     def _create_batch_api(self) -> HPCBatchApi:
         """Construct and return the backend-specific :class:`HPCBatchApi`."""
 
     def start(self, max_cycles: int | None = None, steal=False):
-        """Recover this manager's queued jobs, then run the main loop.
+        """Recover this manager's jobs, then run the main loop.
 
         Without recovery, jobs submitted before a restart would be invisible
         to the cycle: pending jobs would not stop it from submitting more,
-        and running jobs would not be checked for registration. Finished
-        jobs are not recovered; see :meth:`HPCBatchApi.recover_jobs`.
+        and running jobs would not be checked for registration.
 
-        A running job that is not registered with the server is recovered
-        with its original submission time, so a restart does not clear a
-        :class:`JobNotFoundError` halt; the first cycle raises again until
-        the job ends or is cancelled.
+        Recently finished jobs are recovered too, so that jobs which failed
+        while the manager was down are logged, with their reasons, before
+        the first cycle. They are logged at WARNING and do not count toward
+        ``max_consecutive_failed_cycles``: some were already reported before
+        the restart, and a restart should not move the manager closer to
+        stopping.
         """
         try:
-            recovered = self.batch_api.recover_jobs()
+            recovered = self.batch_api.recover_jobs(include_finished=True)
         except Exception as e:
             self.logger.error(f"Failed to recover jobs from the batch system: {e}")
             raise
@@ -520,7 +558,76 @@ class HPCManager(ComputeManager, ABC):
             f"Recovered {len(recovered)} job(s) from the batch system"
             + (f" ({summary})" if summary else "")
         )
+        for job_id, reason in self.batch_api.clear_failed_jobs().items():
+            self.logger.warning(f"Batch job {job_id} failed before startup: {reason}")
         super().start(max_cycles=max_cycles, steal=steal)
+
+    def handle_failed_jobs(self) -> Dict[str, str]:
+        """Log and untrack failed jobs, raising :class:`JobFailureError` if
+        they are found in more than ``max_consecutive_failed_cycles``
+        consecutive checks. Returns ``{job_id: failure reason}``.
+
+        Each call is one check, so call it once per cycle. A check that finds
+        no failed jobs resets the count. A job that fails every cycle usually
+        means a bad job script template or bad settings, and stops the
+        manager loudly; occasional failures (preemption, node failure,
+        timeouts) are logged and the manager carries on.
+        """
+        failed = self.batch_api.clear_failed_jobs()
+        for job_id, reason in failed.items():
+            self.logger.error(f"Batch job {job_id} failed: {reason}")
+
+        self.consecutive_failed_cycles = (
+            self.consecutive_failed_cycles + 1 if failed else 0
+        )
+        limit = self.settings.max_consecutive_failed_cycles
+        if limit is not None and self.consecutive_failed_cycles > limit:
+            raise JobFailureError(
+                f"Failed batch jobs found in {self.consecutive_failed_cycles} "
+                f"consecutive cycles, exceeding max_consecutive_failed_cycles="
+                f"{limit}; most recent: {', '.join(failed)}. Check the job "
+                "script template, the job logs, and the manager and compute "
+                "service settings."
+            )
+        return failed
+
+    def handle_unregistered_jobs(self, server_job_names: Set[str]) -> None:
+        """Warn about running jobs that are not registered with the server,
+        raising :class:`JobNotFoundError` if one stays unregistered.
+
+        A job can be running but unregistered for a while at either end of
+        its life: before its compute service registers (left out by
+        :meth:`HPCBatchApi.find_unregistered_jobs` during the grace period),
+        and after the service deregisters or the server expires a service
+        whose heartbeat lapsed, while the job script and epilog finish. So a
+        job found unregistered is logged and checked again on the next
+        cycle. :class:`JobNotFoundError` is raised once the job has been
+        found unregistered on at least two consecutive checks spanning at
+        least ``job_registration_grace_period`` seconds. A check that finds
+        it registered, or no longer running, forgets it.
+        """
+        grace = self.settings.job_registration_grace_period
+        now = datetime.now(tz=timezone.utc)
+        previous, self._unregistered_jobs = self._unregistered_jobs, {}
+        for job in self.batch_api.find_unregistered_jobs(server_job_names):
+            job_id = job["job_id"]
+            first_found, checks = previous.get(job_id, (now, 0))
+            checks += 1
+            self._unregistered_jobs[job_id] = (first_found, checks)
+            elapsed = int((now - first_found).total_seconds())
+            if checks > 1 and elapsed >= grace:
+                raise JobNotFoundError(
+                    f"Job {job['name']} (batch ID: {job_id}) has been running "
+                    f"but not registered with the server for {checks} "
+                    f"consecutive checks ({elapsed}s). Check that the job "
+                    'script template passes `--name "{{ JOB_NAME }}"` to '
+                    "`alchemiscale compute synchronous`, and check the job's "
+                    "logs. Cancel the job if it is stuck."
+                )
+            self.logger.warning(
+                f"Job {job['name']} (batch ID: {job_id}) is running but not "
+                "registered with the server; checking again next cycle"
+            )
 
 
 class ScriptTemplateHPCManager(HPCManager):
@@ -529,14 +636,17 @@ class ScriptTemplateHPCManager(HPCManager):
     Implements the common ``create_compute_services`` workflow shared by the
     SLURM/LSF/PBS backends:
 
-    1. Health-check tracked jobs.
-    2. Verify running jobs are registered with the server.
+    1. Log and untrack failed jobs (:meth:`HPCManager.handle_failed_jobs`).
+    2. Check running jobs are registered with the server
+       (:meth:`HPCManager.handle_unregistered_jobs`).
     3. Clear successful jobs (semantics are backend-specific; see
        :meth:`HPCBatchApi.clear_successful_jobs`).
     4. If no jobs are pending, submit up to ``target`` new services. The
        sizing decision (how many to actually submit) is made upstream in
        :meth:`alchemiscale.compute.manager.ComputeManager._compute_jobs_to_create`
-       and passed to us as ``target``.
+       and passed to us as ``target``. If every submission fails in more
+       than ``max_consecutive_failed_cycles`` consecutive cycles,
+       :class:`JobSubmissionError` is raised.
 
     Subclasses only need to implement :meth:`_create_job_script`, which renders
     the template into a script ready for ``submit_job``.
@@ -589,11 +699,11 @@ class ScriptTemplateHPCManager(HPCManager):
         # cannot itself contain '-'. Strip the trailing hex suffix.
         server_job_names = {csid.rsplit("-", 1)[0] for csid in compute_service_ids}
 
-        self.logger.info("Checking health of batch jobs")
-        self.batch_api.check_job_health()
+        self.logger.info("Checking for failed batch jobs")
+        self.handle_failed_jobs()
 
         self.logger.info("Verifying running jobs are registered with server")
-        self.batch_api.verify_running_jobs(server_job_names)
+        self.handle_unregistered_jobs(server_job_names)
 
         self.logger.info("Clearing successful jobs")
         self.batch_api.clear_successful_jobs()
@@ -603,22 +713,53 @@ class ScriptTemplateHPCManager(HPCManager):
             return 0
 
         num_submitted = 0
+        error = None
         for _ in range(target):
-            job_script_path = self._create_job_script()
+            job_script_path = None
             try:
+                job_script_path = self._create_job_script()
                 job_id = self.batch_api.submit_job(job_script_path)
                 self.logger.info(f"Submitted batch job {job_id}")
                 num_submitted += 1
             except Exception as e:
                 self.logger.error(f"Failed to submit job: {e}")
+                error = e
                 break
             finally:
-                if not self.settings.keep_job_scripts:
+                if job_script_path is not None and not self.settings.keep_job_scripts:
                     try:
                         os.unlink(job_script_path)
                     except OSError:
                         pass
+        self._count_failed_submissions(num_submitted, error)
         return num_submitted
+
+    def _count_failed_submissions(
+        self, num_submitted: int, error: Optional[Exception]
+    ) -> None:
+        """Count cycles in which every submission failed, raising
+        :class:`JobSubmissionError` once there are more than
+        ``max_consecutive_failed_cycles`` in a row.
+
+        A cycle with at least one successful submission resets the count.
+        Cycles that attempt no submission (jobs pending) leave it unchanged.
+        """
+        if num_submitted:
+            self.consecutive_failed_submission_cycles = 0
+            return
+        if error is None:
+            return
+        self.consecutive_failed_submission_cycles += 1
+        limit = self.settings.max_consecutive_failed_cycles
+        if limit is not None and self.consecutive_failed_submission_cycles > limit:
+            raise JobSubmissionError(
+                "Job submission failed in "
+                f"{self.consecutive_failed_submission_cycles} consecutive "
+                f"cycles, exceeding max_consecutive_failed_cycles={limit}; most "
+                f"recent error: {error}. Check the job script template and the "
+                "manager settings (e.g. partition, account, QoS, submit "
+                "command)."
+            ) from error
 
     def _generate_job_name(self) -> str:
         """Return a unique job name of the form ``{name}.{uuid_hex}``.
