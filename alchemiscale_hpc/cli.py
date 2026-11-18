@@ -123,7 +123,10 @@ def _build_backend_group(backend: str) -> click.Group:
 
     @group.command(
         name="cleanup",
-        help=f"Clear successful and/or failed {backend.upper()} jobs.",
+        help=(
+            f"Find this manager's successful and/or failed {backend.upper()} "
+            "jobs and clear them from tracking."
+        ),
     )
     @config_option
     @click.option("--failed", is_flag=True, help="Clear failed jobs.")
@@ -146,21 +149,33 @@ def _build_backend_group(backend: str) -> click.Group:
         # including recently finished ones, in the batch system.
         batch_api.recover_jobs(include_finished=True)
 
-        def _clear(kind: str, clear) -> None:
-            click.echo(f"Clearing {kind} jobs...")
+        def _clear(kind: str, setting: str, clear) -> None:
+            if not getattr(settings, setting, True):
+                click.echo(f"Skipping {kind} jobs: {setting} is false in the config")
+                return
             before = set(batch_api.tracked_jobs)
             clear()
-            cleared = sorted(before - batch_api.tracked_jobs)
+            found = sorted(before - batch_api.tracked_jobs)
             click.echo(
-                f"Cleared {len(cleared)} {kind} job(s)"
-                + (f": {', '.join(cleared)}" if cleared else "")
+                f"Found {len(found)} {kind} job(s) of manager {settings.name!r}"
+                + (f": {', '.join(found)}" if found else "")
             )
 
         if failed:
-            _clear("failed", batch_api.clear_failed_jobs)
+            _clear("failed", "cleanup_failed_jobs", batch_api.clear_failed_jobs)
 
         if successful:
-            _clear("successful", batch_api.clear_successful_jobs)
+            _clear(
+                "successful",
+                "cleanup_successful_jobs",
+                batch_api.clear_successful_jobs,
+            )
+
+        # Clearing only affects this process's tracking; say so plainly.
+        click.echo(
+            f"{backend.upper()} records are unchanged, and a running manager is "
+            "unaffected; a manager forgets finished jobs when it restarts."
+        )
 
     return group
 

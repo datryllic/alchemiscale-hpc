@@ -3,6 +3,7 @@
 import os
 import re
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set
@@ -40,9 +41,29 @@ _SACCT_RECOVER_FORMAT = "JobID,State,Submit,JobName"
 # sacct scan more of the user's history.
 _FINISHED_LOOKBACK = "now-7days"
 
-# Have squeue/sacct print times as ISO 8601 (``YYYY-MM-DDTHH:MM:SS``, local
-# time), whatever SLURM_TIME_FORMAT the user has set.
-_SLURM_TIME_ENV = {"SLURM_TIME_FORMAT": "standard"}
+# Attempts for the user-scoped recovery queries, and the delay before the
+# second attempt (doubled after each failure), so a transient slurmctld
+# timeout at startup does not stop the manager.
+_QUERY_ATTEMPTS = 3
+_QUERY_BACKOFF_SECONDS = 2.0
+
+
+def _query_env() -> Dict[str, str]:
+    """Environment for the user-scoped recovery queries.
+
+    squeue and sacct read defaults for their options from ``SQUEUE_*`` and
+    ``SACCT_*`` variables (e.g. ``SQUEUE_STATES=all`` would add finished jobs,
+    ``SQUEUE_PARTITION`` would hide jobs on other partitions), so these are
+    dropped. ``SLURM_TIME_FORMAT=standard`` makes times print as ISO 8601
+    (``YYYY-MM-DDTHH:MM:SS``, local time) whatever the user has set.
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("SQUEUE_", "SACCT_"))
+    }
+    env["SLURM_TIME_FORMAT"] = "standard"
+    return env
 
 
 def _whoami() -> str:
@@ -187,11 +208,15 @@ class SlurmBatchApi(HPCBatchApi):
     def recover_jobs(self, include_finished: bool = False) -> List[Dict[str, str]]:
         """Track this manager's jobs found in SLURM.
 
-        Queued jobs come from ``squeue -u <user>``, in every state squeue
-        lists by default (pending, running, suspended, completing, ...). With
-        ``include_finished``, jobs that completed or failed within
-        ``_FINISHED_LOOKBACK`` also come from ``sacct``. That query is not
-        scoped with ``--jobs=``, so it needs an explicit time window.
+        Queued jobs come from ``squeue -u <user> --all``, in every state
+        squeue lists by default (pending, running, suspended, completing,
+        ...). ``--all`` includes jobs on hidden partitions, which plain
+        ``squeue -u`` omits. With ``include_finished``, jobs that completed or
+        failed within ``_FINISHED_LOOKBACK`` also come from ``sacct``. That
+        query is not scoped with ``--jobs=``, so it needs an explicit time
+        window. ``SQUEUE_*``/``SACCT_*`` environment defaults are ignored (see
+        :func:`_query_env`), and each query is retried
+        ``_QUERY_ATTEMPTS`` times before failing.
 
         Only jobs whose name satisfies :func:`is_own_job_name` for
         ``settings.name`` are tracked, so manager ``foo`` does not claim a job
@@ -210,6 +235,7 @@ class SlurmBatchApi(HPCBatchApi):
             self.settings.query_command,
             "-u",
             user,
+            "--all",
             "-o",
             _SQUEUE_RECOVER_FORMAT,
             "--noheader",
@@ -324,20 +350,23 @@ class SlurmBatchApi(HPCBatchApi):
 
         Unlike the ``--jobs=``-scoped queries, where a non-zero exit can just
         mean the listed jobs have left the queue, a query scoped to the user
-        that exits non-zero has failed.
+        that exits non-zero has failed. It is retried up to
+        ``_QUERY_ATTEMPTS`` times, with exponential backoff, before raising.
         """
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            env={**os.environ, **_SLURM_TIME_ENV},
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"{cmd[0]} exited with code {result.returncode}: "
-                f"{result.stderr.strip()}"
+        delay = _QUERY_BACKOFF_SECONDS
+        for attempt in range(1, _QUERY_ATTEMPTS + 1):
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, env=_query_env()
             )
-        return result.stdout
+            if result.returncode == 0:
+                return result.stdout
+            if attempt < _QUERY_ATTEMPTS:
+                time.sleep(delay)
+                delay *= 2
+        raise RuntimeError(
+            f"{cmd[0]} exited with code {result.returncode} after "
+            f"{_QUERY_ATTEMPTS} attempts: {result.stderr.strip()}"
+        )
 
     @staticmethod
     def _parse_jobs_with_submit(text: str) -> List[Dict[str, str]]:

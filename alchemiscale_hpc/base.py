@@ -503,8 +503,17 @@ class HPCManager(ComputeManager, ABC):
         to the cycle: pending jobs would not stop it from submitting more,
         and running jobs would not be checked for registration. Finished
         jobs are not recovered; see :meth:`HPCBatchApi.recover_jobs`.
+
+        A running job that is not registered with the server is recovered
+        with its original submission time, so a restart does not clear a
+        :class:`JobNotFoundError` halt; the first cycle raises again until
+        the job ends or is cancelled.
         """
-        recovered = self.batch_api.recover_jobs()
+        try:
+            recovered = self.batch_api.recover_jobs()
+        except Exception as e:
+            self.logger.error(f"Failed to recover jobs from the batch system: {e}")
+            raise
         counts = Counter(job["state"] for job in recovered)
         summary = ", ".join(f"{n} {state}" for state, n in sorted(counts.items()))
         self.logger.info(

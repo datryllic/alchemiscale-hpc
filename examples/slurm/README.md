@@ -126,26 +126,35 @@ alchemiscale-hpc slurm clear-error \
 
 ### Cleanup Jobs
 
-Clear failed jobs from the manager's in-memory tracking set:
+List the manager's failed jobs:
 
 ```bash
 alchemiscale-hpc slurm cleanup -c my-manager-config.yml --failed
 ```
 
-Clear successful jobs from tracking:
+List the manager's successful jobs:
 
 ```bash
 alchemiscale-hpc slurm cleanup -c my-manager-config.yml --successful
 ```
 
 `cleanup` finds the manager's jobs by name in `squeue` and, for jobs that
-finished in the last 7 days, in `sacct`, and reports which ones it cleared.
-
-Note: for SLURM, `cleanup` only updates in-memory tracking. It does not purge SLURM accounting (`sacct`) records or delete job scripts. (The
-same `cleanup` command on a Kubernetes-style backend would actually delete
-the corresponding Job objects.) To prevent job scripts from being removed
-automatically after submission (useful for debugging), set
+finished in the last 7 days, in `sacct`, and reports the failed or successful
+ones. For SLURM, this is all it does: it clears them only from its own
+in-memory tracking, so SLURM accounting (`sacct`) records, job scripts, and a
+running manager are unaffected. A manager forgets finished jobs when it
+restarts. (The same `cleanup` command on a Kubernetes-style backend would
+actually delete the corresponding Job objects.) To prevent job scripts from
+being removed automatically after submission (useful for debugging), set
 `keep_job_scripts: true` in the manager config.
+
+### Restarting After an Error
+
+On startup, the manager recovers its jobs that are still in the SLURM queue,
+with their original submission times. Restarting therefore does not clear a
+halt caused by a running job that never registered with the server
+(`JobNotFoundError`): the first cycle finds the same job and halts again,
+until the job ends or you cancel it with `scancel`.
 
 ## How It Works
 
@@ -205,7 +214,7 @@ automatically after submission (useful for debugging), set
 6. **Manager tracks** job IDs and cleans up completed/failed jobs. On
    startup, it recovers its queued jobs from `squeue` by job name, so a
    restarted manager does not submit on top of jobs that are still pending.
-   This is why `name` must be unique per cluster account
+   This is why `name` must be unique per cluster account.
 
 ### Job Lifecycle
 

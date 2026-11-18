@@ -9,6 +9,8 @@ from alchemiscale_hpc.base import make_job_name
 from alchemiscale_hpc.cli import _autoload_backends, cli
 from alchemiscale_hpc.slurm import SlurmBatchApi
 
+from .test_slurm import _fake_slurm
+
 
 def test_top_level_help_lists_all_backends():
     runner = CliRunner()
@@ -108,7 +110,51 @@ def test_cleanup_recovers_jobs_before_clearing(slurm_config):
             cli, ["slurm", "cleanup", "-c", str(slurm_config), "--failed"]
         )
     assert result.exit_code == 0, result.output
-    assert "Cleared 1 failed job(s): 7" in result.output
+    assert "Found 1 failed job(s) of manager 'testmgr': 7" in result.output
+    assert "SLURM records are unchanged" in result.output
+
+
+def test_cleanup_finds_failed_jobs_through_slurm(slurm_config):
+    """End to end through squeue/sacct: cleanup finds this manager's failed
+    job, and not another manager's, without any in-memory state."""
+    own = [make_job_name("testmgr") for _ in range(3)]
+    other = make_job_name("testmgr.bar")
+    ts = "2026-11-18T09:30:00"
+    run, calls = _fake_slurm(
+        squeue_user=f"5|RUNNING|{ts}|{own[0]}\n",
+        sacct_user=(
+            f"7|FAILED|{ts}|{own[1]}\n"
+            f"8|COMPLETED|{ts}|{own[2]}\n"
+            f"9|FAILED|{ts}|{other}\n"
+        ),
+        sacct_tracked=f"7|FAILED|{own[1]}\n",
+    )
+    runner = CliRunner()
+    with patch("subprocess.run", side_effect=run), patch(
+        "alchemiscale_hpc.slurm.manager._whoami", return_value="alice"
+    ):
+        result = runner.invoke(
+            cli, ["slurm", "cleanup", "-c", str(slurm_config), "--failed"]
+        )
+    assert result.exit_code == 0, result.output
+    assert "Found 1 failed job(s) of manager 'testmgr': 7" in result.output
+    # The failed-job query is scoped to this manager's recovered jobs only.
+    [scoped] = [c for c in calls if any(a.startswith("--jobs=") for a in c)]
+    assert "--jobs=5,7,8" in scoped
+
+
+def test_cleanup_respects_disabled_setting(slurm_config):
+    slurm_config.write_text(
+        slurm_config.read_text() + "cleanup_failed_jobs: false\n"
+    )
+    runner = CliRunner()
+    with patch.object(SlurmBatchApi, "recover_jobs", return_value=[]):
+        result = runner.invoke(
+            cli, ["slurm", "cleanup", "-c", str(slurm_config), "--failed"]
+        )
+    assert result.exit_code == 0, result.output
+    assert "Skipping failed jobs: cleanup_failed_jobs is false" in result.output
+    assert "Found" not in result.output
 
 
 def test_unknown_subcommand_fails_cleanly():

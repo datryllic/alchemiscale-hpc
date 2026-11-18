@@ -1,6 +1,7 @@
 """Tests for the SLURM batch API and manager."""
 
 import re
+import time
 import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -780,12 +781,18 @@ class _Result:
         self.returncode = returncode
 
 
-def _fake_slurm(squeue_user: str = "", sacct_user: str = "", tracked: dict = None):
+def _fake_slurm(
+    squeue_user: str = "",
+    sacct_user: str = "",
+    tracked: dict = None,
+    sacct_tracked: str = "",
+):
     """Fake ``subprocess.run`` for squeue/sacct.
 
     ``squeue_user``/``sacct_user`` answer user-scoped queries (recovery);
     ``tracked`` maps a ``--states=`` value to the answer for ``--jobs=``-scoped
-    squeue queries (the manager loop). Every call is recorded in ``calls``.
+    squeue queries, and ``sacct_tracked`` answers ``--jobs=``-scoped sacct
+    queries (the manager loop). Every call is recorded in ``calls``.
     """
     calls = []
 
@@ -798,6 +805,8 @@ def _fake_slurm(squeue_user: str = "", sacct_user: str = "", tracked: dict = Non
             return _Result((tracked or {}).get(state.split("=", 1)[1], ""))
         if cmd[0] == "sacct" and "-u" in cmd:
             return _Result(sacct_user)
+        if cmd[0] == "sacct":
+            return _Result(sacct_tracked)
         return _Result()
 
     return run, calls
@@ -809,13 +818,23 @@ def whoami():
         yield
 
 
+@pytest.fixture
+def denver_tz(monkeypatch):
+    """Run in a non-UTC local zone, so local/UTC mix-ups fail even on UTC CI."""
+    monkeypatch.setenv("TZ", "America/Denver")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
 def _local(ts: datetime) -> str:
     """Format ``ts`` as SLURM prints times with SLURM_TIME_FORMAT=standard."""
     return ts.astimezone().replace(tzinfo=None).isoformat(timespec="seconds")
 
 
 def test_recover_jobs_tracks_own_queued_jobs(
-    slurm_settings: SlurmManagerSettings, whoami
+    slurm_settings: SlurmManagerSettings, whoami, denver_tz
 ):
     """Own pending and running jobs are tracked with SLURM's submit times;
     other jobs, including ones of a manager whose name extends ours, are not."""
@@ -848,20 +867,35 @@ def test_recover_jobs_tracks_own_queued_jobs(
     # Only squeue, scoped to the user and including the submit time.
     [cmd] = calls
     assert cmd[:3] == ["squeue", "-u", "alice"]
+    # Plain ``squeue -u`` omits jobs on hidden partitions.
+    assert "--all" in cmd
     assert "%i|%T|%V|%j" in cmd
 
 
-def test_recover_jobs_sets_standard_time_format(
+def test_recover_jobs_ignores_slurm_environment_defaults(
     slurm_settings: SlurmManagerSettings, whoami
 ):
-    """Submit times are requested as ISO 8601 whatever the user's
-    SLURM_TIME_FORMAT is."""
+    """SQUEUE_*/SACCT_* defaults (e.g. SQUEUE_STATES=all, which would add
+    finished jobs) are dropped, and times are requested as ISO 8601 whatever
+    the user's SLURM_TIME_FORMAT is. Other variables pass through."""
     api = SlurmBatchApi(slurm_settings)
-    with patch.dict("os.environ", {"SLURM_TIME_FORMAT": "relative"}), patch(
+    user_env = {
+        "SLURM_TIME_FORMAT": "relative",
+        "SQUEUE_STATES": "all",
+        "SQUEUE_PARTITION": "debug",
+        "SACCT_FEDERATION": "1",
+        "SLURM_CONF": "/etc/slurm/slurm.conf",
+    }
+    with patch.dict("os.environ", user_env), patch(
         "subprocess.run", return_value=_Result()
     ) as mock_run:
-        api.recover_jobs()
-    assert mock_run.call_args.kwargs["env"]["SLURM_TIME_FORMAT"] == "standard"
+        api.recover_jobs(include_finished=True)
+    assert mock_run.call_count == 2  # squeue and sacct
+    for call in mock_run.call_args_list:
+        env = call.kwargs["env"]
+        assert env["SLURM_TIME_FORMAT"] == "standard"
+        assert not any(k.startswith(("SQUEUE_", "SACCT_")) for k in env)
+        assert env["SLURM_CONF"] == "/etc/slurm/slurm.conf"
 
 
 def test_recover_jobs_unparseable_submit_time_grants_grace(
@@ -904,9 +938,33 @@ def test_recover_jobs_raises_on_query_failure(
     would let the manager over-submit."""
     api = SlurmBatchApi(slurm_settings)
     failure = _Result(stderr="slurm_load_jobs error: timeout\n", returncode=1)
-    with patch("subprocess.run", return_value=failure):
-        with pytest.raises(RuntimeError, match="squeue exited with code 1.*timeout"):
+    with patch("subprocess.run", return_value=failure) as mock_run, patch(
+        "alchemiscale_hpc.slurm.manager.time.sleep"
+    ) as sleep:
+        with pytest.raises(
+            RuntimeError, match="squeue exited with code 1 after 3 attempts.*timeout"
+        ):
             api.recover_jobs()
+    assert mock_run.call_count == 3
+    assert [c.args[0] for c in sleep.call_args_list] == [2.0, 4.0]
+
+
+def test_recover_jobs_retries_transient_failure(
+    slurm_settings: SlurmManagerSettings, whoami
+):
+    """A query that fails once and then succeeds does not stop recovery."""
+    job_name = make_job_name(slurm_settings.name)
+    results = [
+        _Result(stderr="Socket timed out\n", returncode=1),
+        _Result(f"101|PENDING|Unknown|{job_name}\n"),
+    ]
+    api = SlurmBatchApi(slurm_settings)
+    with patch("subprocess.run", side_effect=results), patch(
+        "alchemiscale_hpc.slurm.manager.time.sleep"
+    ) as sleep:
+        recovered = api.recover_jobs()
+    assert [job["job_id"] for job in recovered] == ["101"]
+    sleep.assert_called_once()
 
 
 def test_recover_jobs_include_finished_queries_sacct(
@@ -937,7 +995,7 @@ def test_recover_jobs_include_finished_queries_sacct(
 
 
 def test_jobs_submitted_before_restart_are_recovered(
-    slurm_settings: SlurmManagerSettings, tmp_path: Path, whoami
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, whoami, denver_tz
 ):
     """After a restart, recovered pending jobs block new submissions and
     recovered running jobs are checked for registration."""
@@ -979,7 +1037,7 @@ def test_jobs_submitted_before_restart_are_recovered(
 
 
 def test_recovered_job_grace_period_runs_from_submit_time(
-    slurm_settings: SlurmManagerSettings, whoami
+    slurm_settings: SlurmManagerSettings, whoami, denver_tz
 ):
     """The grace period runs from SLURM's submit time, not from recovery."""
     settings = slurm_settings.model_copy(update={"job_registration_grace_period": 600})
@@ -1002,9 +1060,11 @@ def test_recovered_job_grace_period_runs_from_submit_time(
                 api.verify_running_jobs(set())
 
 
-def test_parse_submit_time():
-    local = datetime(2026, 11, 18, 9, 30, 0).astimezone()
-    assert _parse_submit_time(local.replace(tzinfo=None).isoformat()) == local
+def test_parse_submit_time(denver_tz):
+    """SLURM prints local time; America/Denver is UTC-7 in November."""
+    assert _parse_submit_time("2026-11-18T09:30:00") == datetime(
+        2026, 11, 18, 16, 30, tzinfo=timezone.utc
+    )
     assert _parse_submit_time("Unknown") is None
     assert _parse_submit_time("N/A") is None
 
@@ -1027,13 +1087,16 @@ def test_manager_start_recovers_jobs_before_first_cycle(
 
 
 def test_manager_start_fails_if_recovery_fails(
-    slurm_settings: SlurmManagerSettings, tmp_path: Path
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, caplog
 ):
-    """Starting without knowing which jobs are ours would over-submit."""
+    """Starting without knowing which jobs are ours would over-submit. The
+    reason reaches the manager log, not just the traceback."""
     mgr = _build_manager(slurm_settings, tmp_path)
     with patch.object(
         mgr.batch_api, "recover_jobs", side_effect=RuntimeError("squeue down")
     ), patch("alchemiscale.compute.manager.ComputeManager.start") as start:
-        with pytest.raises(RuntimeError, match="squeue down"):
-            mgr.start()
+        with caplog.at_level("ERROR", logger="AlchemiscaleComputeManager"):
+            with pytest.raises(RuntimeError, match="squeue down"):
+                mgr.start()
     start.assert_not_called()
+    assert "Failed to recover jobs from the batch system: squeue down" in caplog.text
