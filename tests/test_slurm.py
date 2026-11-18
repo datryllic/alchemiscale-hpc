@@ -444,10 +444,17 @@ def _build_manager(
     )
     # Bypass network/registration in ComputeManager.__init__ by patching the
     # client constructor it triggers.
-    with patch("alchemiscale.compute.manager.AlchemiscaleComputeManagerClient"):
-        return SlurmManager(
+    # ``autospec`` so upstream signature drift in e.g. ``get_instruction`` or
+    # ``update_status`` fails these tests.
+    with patch(
+        "alchemiscale.compute.manager.AlchemiscaleComputeManagerClient", autospec=True
+    ):
+        mgr = SlurmManager(
             settings=slurm_settings, service_settings_path=service_config
         )
+    # Instance attribute set in the real client's __init__; autospec can't see it.
+    mgr.client.api_url = "http://example.com"
+    return mgr
 
 
 def test_slurm_manager_create_batch_api_factory(
@@ -644,12 +651,23 @@ def test_create_compute_services_does_not_run_maintenance(
     ``maintain_compute_services``."""
     mgr = _build_manager(slurm_settings, tmp_path)
     with patch.object(mgr, "maintain_compute_services") as maintain, patch.object(
+        mgr.batch_api, "check_job_health"
+    ) as health, patch.object(
+        mgr.batch_api, "verify_running_jobs"
+    ) as verify, patch.object(
+        mgr.batch_api, "clear_successful_jobs"
+    ) as clear, patch.object(
         mgr.batch_api, "jobs_pending", return_value=False
-    ), patch.object(mgr.batch_api, "submit_job", return_value="1"):
+    ), patch.object(
+        mgr.batch_api, "submit_job", return_value="1"
+    ):
         mgr.create_compute_services(
             {"compute_service_ids": [], "num_tasks": 1}, target=1
         )
     maintain.assert_not_called()
+    health.assert_not_called()
+    verify.assert_not_called()
+    clear.assert_not_called()
 
 
 # ----------------------------------------------------------------------
@@ -729,6 +747,67 @@ def test_cycle_runs_maintenance_before_scale_up(
         assert mgr.cycle() is True
 
     assert calls == ["maintain", "create"]
+
+
+def test_cycle_scale_up_runs_each_primitive_once(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """End-to-end scale-up cycle with the real ``create_compute_services``:
+    each maintenance primitive runs exactly once, then the job is submitted."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    mgr.client.get_instruction.return_value = (
+        ComputeManagerInstruction.OK,
+        {"compute_service_ids": [], "num_tasks": 1},
+    )
+
+    with patch.object(mgr.batch_api, "check_job_health") as health, patch.object(
+        mgr.batch_api, "verify_running_jobs"
+    ) as verify, patch.object(
+        mgr.batch_api, "clear_successful_jobs"
+    ) as clear, patch.object(
+        mgr.batch_api, "jobs_pending", return_value=False
+    ), patch.object(
+        mgr.batch_api, "submit_job", return_value="1"
+    ) as submit:
+        assert mgr.cycle() is True
+
+    health.assert_called_once_with()
+    verify.assert_called_once_with(set())
+    clear.assert_called_once_with()
+    submit.assert_called_once()
+
+
+class _FakeClient:
+    """Plain (non-mock) client, to observe how ``cycle`` patches it."""
+
+    api_url = "http://example.com"
+
+    def get_instruction(self, scopes, protocols, compute_manager_id):
+        return ComputeManagerInstruction.OK, {
+            "compute_service_ids": [],
+            "num_tasks": 0,
+        }
+
+    def update_status(self, compute_manager_id, status, detail=None, saturation=None):
+        pass
+
+
+def test_cycle_restores_client_get_instruction(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """``cycle`` leaves no ``get_instruction`` instance attribute behind, so
+    later cycles resolve the method afresh from the client class."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    client = _FakeClient()
+    mgr.client = client
+
+    with patch.object(mgr, "maintain_compute_services") as maintain:
+        assert mgr.cycle() is True
+        assert "get_instruction" not in vars(client)
+        assert mgr.cycle() is True
+        assert "get_instruction" not in vars(client)
+
+    assert maintain.call_count == 2
 
 
 def test_cycle_runs_maintenance_on_skip(

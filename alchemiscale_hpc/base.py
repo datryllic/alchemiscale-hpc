@@ -26,6 +26,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set
+from unittest.mock import patch
 from uuid import uuid4
 
 import yaml
@@ -381,17 +382,21 @@ class HPCManager(ComputeManager, ABC):
                 self.maintain_compute_services(data)
             return instruction, data
 
-        client.get_instruction = _get_instruction_and_maintain
-        try:
+        # ``patch.object`` restores the client exactly on exit: it removes the
+        # shadowing instance attribute rather than pinning the bound method.
+        with patch.object(client, "get_instruction", _get_instruction_and_maintain):
             return super().cycle()
-        finally:
-            client.get_instruction = get_instruction
 
     def maintain_compute_services(self, data: dict) -> None:
         """Per-cycle backend housekeeping, independent of scale-up.
 
         Called on every ``OK`` and ``SKIP`` instruction, before the upstream
-        sizing decision and any call to :meth:`create_compute_services`:
+        sizing decision and any call to :meth:`create_compute_services`.
+        Upstream ``ComputeManager`` has no such hook; one is proposed (not
+        filed) in datryllic/alchemiscale-hpc#14, which would let us drop the
+        :meth:`cycle` override.
+
+        Steps:
 
         1. Health-check tracked jobs.
         2. Verify running jobs are registered with the server.
