@@ -1,17 +1,21 @@
 """Tests for the SLURM batch API and manager."""
 
 import re
+import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
+from alchemiscale.storage.models import ComputeManagerID, ComputeServiceID
 
 from alchemiscale_hpc import (
     HPCBatchApi,
     JobFailureError,
     JobNotFoundError,
 )
+from alchemiscale_hpc.base import is_own_job_name, make_job_name
 from alchemiscale_hpc.slurm import (
     SlurmBatchApi,
     SlurmManager,
@@ -104,6 +108,10 @@ def _settings_kwargs(tmp_path: Path, **overrides) -> dict:
 def test_settings_accepts_valid_name(tmp_path: Path, name: str):
     settings = SlurmManagerSettings(**_settings_kwargs(tmp_path, name=name))
     assert settings.name == name
+    # Catch drift from upstream's ID rules: names we accept must yield IDs
+    # alchemiscale accepts, for both the manager and its jobs' services.
+    ComputeManagerID.new_from_name(name)
+    ComputeServiceID.new_from_name(make_job_name(name))
 
 
 @pytest.mark.parametrize(
@@ -117,16 +125,66 @@ def test_settings_rejects_invalid_name(tmp_path: Path, name: str):
 
 
 def test_settings_job_name_prefix_is_deprecated_and_ignored(tmp_path: Path):
-    """Configs that still set ``job_name_prefix`` load, with a warning.
+    """Configs that still set ``job_name_prefix`` load, with a visible warning.
 
     The prefix is ignored, even an invalid one, since job names are built
-    from ``name``.
+    from ``name``. The warning is a FutureWarning (shown by default) naming
+    the ignored prefix and the new job names, since operators' filters on
+    the old prefix stop matching.
     """
-    with pytest.warns(DeprecationWarning, match="job_name_prefix"):
+    with pytest.warns(FutureWarning) as record:
         settings = SlurmManagerSettings(
             **_settings_kwargs(tmp_path, job_name_prefix="my-experiment")
         )
     assert not hasattr(settings, "job_name_prefix")
+    assert settings._ignored_job_name_prefix == "my-experiment"
+    [warning] = record
+    message = str(warning.message)
+    assert "job_name_prefix='my-experiment' is deprecated and ignored" in message
+    assert "'testmgr.<uuid_hex>'" in message
+
+
+def test_settings_without_job_name_prefix_does_not_warn(tmp_path: Path):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        settings = SlurmManagerSettings(**_settings_kwargs(tmp_path))
+    assert settings._ignored_job_name_prefix is None
+
+
+def test_manager_logs_ignored_job_name_prefix(tmp_path: Path, caplog):
+    """The manager repeats the job_name_prefix warning in its own log."""
+    with pytest.warns(FutureWarning):
+        settings = SlurmManagerSettings(
+            **_settings_kwargs(tmp_path, job_name_prefix="alchemiscale")
+        )
+    with caplog.at_level("WARNING", logger="AlchemiscaleComputeManager"):
+        _build_manager(settings, tmp_path)
+    assert "job_name_prefix='alchemiscale' is deprecated and ignored" in caplog.text
+
+
+def test_is_own_job_name_matches_generated_names():
+    assert is_own_job_name("foo", make_job_name("foo"))
+    assert is_own_job_name("foo.bar", make_job_name("foo.bar"))
+
+
+@pytest.mark.parametrize(
+    "job_name",
+    [
+        # Another manager whose name extends ours with a ".".
+        f"foo.bar.{uuid4().hex}",
+        # Another manager whose name extends ours without a ".".
+        f"foobar.{uuid4().hex}",
+        # Not a uuid4().hex suffix: uppercase, too short, too long.
+        f"foo.{uuid4().hex.upper()}",
+        "foo.deadbeef",
+        f"foo.{uuid4().hex}0",
+        # Regex metacharacters in the name are matched literally.
+        f"fooX{uuid4().hex}",
+        "foo",
+    ],
+)
+def test_is_own_job_name_rejects_other_names(job_name: str):
+    assert not is_own_job_name("foo", job_name)
 
 
 def test_generate_job_name_identifies_manager(tmp_path: Path):

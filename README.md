@@ -122,7 +122,8 @@ The package uses a modular architecture with two abstraction layers:
    - `HPCManagerSettings`: settings every backend needs (`name`,
      `max_submit_per_cycle`, ...). Job names are built as
      `<name>.<uuid_hex>`, so `name` is validated against alchemiscale's
-     compute ID rules.
+     compute ID rules, and should be unique per cluster account across
+     alchemiscale servers.
 
 2. **Script-template convenience layer** (`base.py`): the workflow shared
    by SLURM/LSF/PBS.

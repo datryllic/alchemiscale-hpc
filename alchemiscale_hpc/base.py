@@ -30,7 +30,7 @@ from typing import Dict, List, Optional, Set
 from uuid import uuid4
 
 import yaml
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 
 from alchemiscale.compute.manager import ComputeManager
 from alchemiscale.compute.settings import ComputeManagerSettings, ComputeServiceSettings
@@ -89,6 +89,31 @@ def list_backends() -> List[str]:
 _MANAGER_NAME_PATTERN = re.compile(r"[a-zA-Z][a-zA-Z0-9_.:]*")
 
 
+def make_job_name(manager_name: str) -> str:
+    """Return a new, unique batch job name for the manager ``manager_name``.
+
+    Job names have the form ``{manager_name}.{uuid_hex}``, with the 32-char
+    lowercase hex form of a :func:`uuid.uuid4` (no internal dashes). This
+    matches the alchemiscale-k8s convention and keeps the resulting
+    ComputeServiceID (``{job_name}-{uuid_hex}``) unambiguously parseable.
+    """
+    return f"{manager_name}.{uuid4().hex}"
+
+
+def is_own_job_name(manager_name: str, job_name: str) -> bool:
+    """Return True if ``job_name`` was generated for ``manager_name``.
+
+    Matches exactly ``{manager_name}.{32 lowercase hex chars}``, as produced
+    by :func:`make_job_name`. A plain prefix check is not enough because
+    manager names may contain ``.``: manager ``foo`` must not claim jobs of
+    manager ``foo.bar``, which are named ``foo.bar.{uuid_hex}``.
+    """
+    return (
+        re.fullmatch(rf"{re.escape(manager_name)}\.[0-9a-f]{{32}}", job_name)
+        is not None
+    )
+
+
 class JobNotFoundError(Exception):
     """Raised when a job is not found in the batch queue."""
 
@@ -108,6 +133,11 @@ class HPCManagerSettings(ComputeManagerSettings):
     Batch jobs are named ``{name}.{uuid_hex}``, so the manager's ``name``
     identifies the jobs it submits.
     """
+
+    # Value of the deprecated ``job_name_prefix`` if the config set one, so
+    # the manager can repeat the warning in its own log. See
+    # :meth:`_drop_job_name_prefix`.
+    _ignored_job_name_prefix: Optional[str] = PrivateAttr(None)
 
     @field_validator("name")
     @classmethod
@@ -134,33 +164,45 @@ class HPCManagerSettings(ComputeManagerSettings):
             )
         return value
 
-    @model_validator(mode="before")
+    @model_validator(mode="wrap")
     @classmethod
-    def _drop_job_name_prefix(cls, data):
+    def _drop_job_name_prefix(cls, data, handler):
         """Backward-compat: ``job_name_prefix`` used to set the job name prefix
         independently of ``name``.
 
-        Job names are now always built from ``name``, which is required to be
-        distinct across compute managers, so the job name identifies the
-        manager that submitted it. Existing configs that still set
-        ``job_name_prefix`` continue to load; the value is ignored and a
-        :class:`DeprecationWarning` is emitted.
+        Job names are now always built from ``name``, so they identify the
+        manager that submitted them. alchemiscale rejects a second manager
+        registering under a name that is already registered with the same
+        server, but managers pointed at different servers can share a name;
+        operators should keep names unique per cluster account.
+
+        Existing configs that still set ``job_name_prefix`` continue to load;
+        the value is ignored and a :class:`FutureWarning` (shown by default,
+        unlike :class:`DeprecationWarning`) names the old and new job names,
+        since filters on the old prefix (``squeue``, ``sacct``, ``scancel``)
+        stop matching.
         """
-        if not isinstance(data, dict):
-            return data
-        if "job_name_prefix" not in data:
-            return data
+        if not isinstance(data, dict) or "job_name_prefix" not in data:
+            return handler(data)
 
         data = dict(data)
-        data.pop("job_name_prefix")
+        prefix = data.pop("job_name_prefix")
+        settings = handler(data)
+        settings._ignored_job_name_prefix = prefix
         warnings.warn(
-            f"{cls.__name__}.job_name_prefix is deprecated and ignored; batch "
-            "job names are now built from the manager's name as "
-            "'{name}.{uuid_hex}'.",
-            DeprecationWarning,
-            stacklevel=2,
+            job_name_prefix_ignored_message(prefix, settings.name), FutureWarning
         )
-        return data
+        return settings
+
+
+def job_name_prefix_ignored_message(prefix, name: str) -> str:
+    """Message for a config that still sets the deprecated ``job_name_prefix``."""
+    return (
+        f"job_name_prefix={prefix!r} is deprecated and ignored; batch jobs are "
+        f"now named after the manager's name, as '{name}.<uuid_hex>' instead "
+        f"of '{prefix}.<uuid_hex>'. Update any squeue/sacct/scancel filters "
+        "that match the old prefix, and remove job_name_prefix from the config."
+    )
 
 
 class ScriptTemplateHPCManagerSettings(HPCManagerSettings):
@@ -400,6 +442,10 @@ class HPCManager(ComputeManager, ABC):
         service_settings = ComputeServiceSettings(**service_settings_dict)
         super().__init__(settings=settings, service_settings=service_settings)
 
+        prefix = getattr(settings, "_ignored_job_name_prefix", None)
+        if prefix is not None:
+            self.logger.warning(job_name_prefix_ignored_message(prefix, settings.name))
+
         # Subclasses provide the concrete batch API via _create_batch_api().
         self.batch_api: HPCBatchApi = self._create_batch_api()
 
@@ -508,14 +554,10 @@ class ScriptTemplateHPCManager(HPCManager):
     def _generate_job_name(self) -> str:
         """Return a unique job name of the form ``{name}.{uuid_hex}``.
 
-        Uses the same ``.``-separated format as the alchemiscale-k8s reference
-        backend (``f"{name}.{uuid4().hex}"``). The UUID portion is the 32-char
-        hex form (no internal dashes), which keeps the resulting
-        ComputeServiceID (``{name}-{uuid_hex}``) unambiguously parseable: the
-        only ``-`` is the one separating the service name from the trailing
-        hex suffix added by ``ComputeServiceID.new_from_name``.
+        See :func:`make_job_name`; :func:`is_own_job_name` recognizes the
+        result.
         """
-        return f"{self.settings.name}.{uuid4().hex}"
+        return make_job_name(self.settings.name)
 
     def _render_template(self, substitutions: Dict[str, str]) -> str:
         """Substitute ``{{ KEY }}`` placeholders in the loaded template."""

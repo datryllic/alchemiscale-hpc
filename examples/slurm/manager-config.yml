@@ -7,6 +7,9 @@
 # Must be distinct from all other compute managers. SLURM job names are built
 # from it as <name>.<uuid_hex>, so it must start with a letter and contain only
 # letters, digits, underscores, periods, and colons (no hyphens).
+# The alchemiscale server only rejects duplicate names among managers
+# registered with it, so also keep names unique across all managers on this
+# cluster account, including ones pointed at other alchemiscale servers.
 name: "my_slurm_manager"
 
 # Path to SLURM job script template (required)

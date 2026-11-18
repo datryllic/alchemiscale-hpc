@@ -37,7 +37,10 @@ cp examples/slurm/service-config.yml my-service-config.yml
 **Edit `my-manager-config.yml`:**
 - Set `name` to a unique identifier for this manager. SLURM job names are
   built as `<name>.<uuid_hex>`, so `name` must start with a letter and contain
-  only letters, digits, `_`, `.`, and `:` (no `-`)
+  only letters, digits, `_`, `.`, and `:` (no `-`). Keep it unique across all
+  managers on the cluster account, including ones pointed at other
+  alchemiscale servers; the server only rejects duplicates among managers
+  registered with it
 - Set `job_script_template` to the path of your job template
 - Configure `partition`, `account`, `qos` for your SLURM system
 - Set `max_compute_services` based on your resource allocation
