@@ -34,9 +34,11 @@ from pydantic import Field
 from alchemiscale.compute.manager import ComputeManager
 from alchemiscale.compute.settings import ComputeManagerSettings, ComputeServiceSettings
 
-# Matches any ``{{ ... }}`` token within a line, whatever its spacing, so that
-# near-misses like ``{{JOB_NAME}}`` are reported along with unknown names.
-_TEMPLATE_TOKEN = re.compile(r"\{\{[^{}\n]*\}\}")
+# Matches any ``{{ ... }}`` token, whatever its spacing (including newlines), so
+# that near-misses like ``{{JOB_NAME}}`` are reported along with unknown names.
+# Extra surrounding braces are not flagged: ``{{{ JOB_NAME }}}`` passes
+# validation but renders as ``{<job name>}``.
+_TEMPLATE_TOKEN = re.compile(r"\{\{[^{}]*\}\}")
 
 
 def _placeholder(key: str) -> str:
@@ -393,7 +395,8 @@ class ScriptTemplateHPCManager(HPCManager):
 
     #: Every placeholder the backend substitutes. Used both to validate the
     #: template at construction and to check the keys passed to
-    #: :meth:`_render_template`, so the two cannot drift apart.
+    #: :meth:`_render_template`, so a mismatch between them is caught on the
+    #: first render (and in tests).
     TEMPLATE_PLACEHOLDERS: ClassVar[FrozenSet[str]] = REQUIRED_TEMPLATE_PLACEHOLDERS
 
     def __init__(

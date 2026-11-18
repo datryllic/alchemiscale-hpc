@@ -698,15 +698,19 @@ def test_template_unknown_placeholder_warns(
 ):
     """Unknown or mis-spaced ``{{ ... }}`` tokens are logged as warnings."""
     template = slurm_settings.job_script_template
-    template.write_text(template.read_text() + "{{ PARITION }}\necho {{JOB_NAME}}\n")
+    template.write_text(
+        template.read_text()
+        + "{{ PARITION }}\necho {{JOB_NAME}}\necho {{ QOS\n}}\n"
+    )
 
     with caplog.at_level("WARNING"):
         _build_manager(slurm_settings, tmp_path)
 
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-    assert len(warnings) == 2
+    assert len(warnings) == 3
     assert any("{{ PARITION }}" in w for w in warnings)
     assert any("{{JOB_NAME}}" in w for w in warnings)
+    assert any("{{ QOS\n}}" in w for w in warnings)
 
 
 def test_example_template_validates_cleanly(
