@@ -9,7 +9,8 @@ Two abstraction layers are provided:
 * :class:`HPCManager` --- the bare-minimum manager contract. Subclasses must
   implement :meth:`HPCManager.create_compute_services` (inherited as abstract
   from :class:`alchemiscale.compute.manager.ComputeManager`) and
-  :meth:`HPCManager._create_batch_api`.
+  :meth:`HPCManager._create_batch_api`. It also runs per-cycle backend
+  housekeeping via :meth:`HPCManager.maintain_compute_services`.
 * :class:`ScriptTemplateHPCManager` --- a concrete subclass that implements
   the common "render a job script from a template, then submit it" workflow
   used by all current backends (SLURM, LSF, PBS). Subclasses only need to
@@ -32,6 +33,7 @@ from pydantic import Field
 
 from alchemiscale.compute.manager import ComputeManager
 from alchemiscale.compute.settings import ComputeManagerSettings, ComputeServiceSettings
+from alchemiscale.storage.models import ComputeManagerInstruction
 
 # Registry of available backends, populated by backend modules at import time.
 # Maps backend name (e.g. "slurm") -> (Manager class, Settings class, BatchApi class).
@@ -174,9 +176,10 @@ class HPCBatchApi(ABC):
     production-quality backend, but useful to know which is which when
     implementing or maintaining a new system:
 
-    **Manager-loop primitives** (called every cycle by
-    :meth:`ScriptTemplateHPCManager.create_compute_services`; correctness
-    of autoscaling depends on these):
+    **Manager-loop primitives** (called by
+    :meth:`HPCManager.maintain_compute_services` every ``OK``/``SKIP``
+    cycle, or by :meth:`ScriptTemplateHPCManager.create_compute_services`
+    on scale-up cycles; correctness of autoscaling depends on these):
 
     * :meth:`check_job_health` --- raise on tracked-job failure
     * :meth:`verify_running_jobs` --- sanity-check running jobs are
@@ -241,7 +244,8 @@ class HPCBatchApi(ABC):
     # ------------------------------------------------------------------
     # Manager-loop primitives
     # ------------------------------------------------------------------
-    # Called every cycle by ScriptTemplateHPCManager.create_compute_services.
+    # Called by HPCManager.maintain_compute_services (every OK/SKIP cycle)
+    # and ScriptTemplateHPCManager.create_compute_services (scale-up cycles).
     # Correctness of autoscaling depends on these.
 
     @abstractmethod
@@ -271,8 +275,9 @@ class HPCBatchApi(ABC):
         an in-memory operation (drop the IDs from ``tracked_jobs``); for
         Kubernetes-style backends this should actually delete the Job
         objects from the batch system. Either way, this is called
-        unconditionally in :meth:`ScriptTemplateHPCManager.create_compute_services`
-        once per cycle, gated only by the ``cleanup_successful_jobs`` setting.
+        unconditionally in :meth:`HPCManager.maintain_compute_services`
+        once per ``OK``/``SKIP`` cycle, gated only by the
+        ``cleanup_successful_jobs`` setting.
         """
 
     @abstractmethod
@@ -316,7 +321,9 @@ class HPCManager(ComputeManager, ABC):
 
     Subclasses must implement :meth:`_create_batch_api` and
     :meth:`create_compute_services` (inherited from
-    :class:`alchemiscale.compute.manager.ComputeManager`).
+    :class:`alchemiscale.compute.manager.ComputeManager`). Backend
+    housekeeping runs every ``OK``/``SKIP`` cycle via
+    :meth:`maintain_compute_services`, which subclasses may extend.
 
     For backends that follow the standard "render script template, submit
     via batch system" pattern, prefer subclassing
@@ -350,21 +357,82 @@ class HPCManager(ComputeManager, ABC):
     def _create_batch_api(self) -> HPCBatchApi:
         """Construct and return the backend-specific :class:`HPCBatchApi`."""
 
+    def cycle(self) -> bool:
+        """Run one manager cycle, with backend maintenance on every ``OK``/``SKIP``.
+
+        The upstream :meth:`ComputeManager.cycle` only calls
+        :meth:`create_compute_services` when scaling up, and has no hook for
+        per-cycle housekeeping. Rather than duplicate its body here, we wrap
+        ``client.get_instruction`` for the duration of the cycle so that
+        :meth:`maintain_compute_services` runs on the instruction data as soon
+        as it arrives, before any sizing or submission. ``SHUTDOWN`` skips
+        maintenance. Exceptions raised by maintenance propagate out of
+        ``cycle`` exactly as they would from :meth:`create_compute_services`.
+        """
+        client = self.client
+        get_instruction = client.get_instruction
+
+        def _get_instruction_and_maintain(*args, **kwargs):
+            instruction, data = get_instruction(*args, **kwargs)
+            if instruction in (
+                ComputeManagerInstruction.OK,
+                ComputeManagerInstruction.SKIP,
+            ):
+                self.maintain_compute_services(data)
+            return instruction, data
+
+        client.get_instruction = _get_instruction_and_maintain
+        try:
+            return super().cycle()
+        finally:
+            client.get_instruction = get_instruction
+
+    def maintain_compute_services(self, data: dict) -> None:
+        """Per-cycle backend housekeeping, independent of scale-up.
+
+        Called on every ``OK`` and ``SKIP`` instruction, before the upstream
+        sizing decision and any call to :meth:`create_compute_services`:
+
+        1. Health-check tracked jobs.
+        2. Verify running jobs are registered with the server.
+        3. Clear successful jobs (semantics are backend-specific; see
+           :meth:`HPCBatchApi.clear_successful_jobs`).
+
+        Parameters
+        ----------
+        data
+            Data from the server instruction. Both ``OK`` and ``SKIP``
+            instructions carry ``compute_service_ids``, the list of services
+            the server currently associates with this manager.
+        """
+        # Each ComputeServiceID has form "{name}-{uuid_hex}". Strip only the
+        # trailing hex suffix so that service `name` (which may itself contain
+        # hyphens, e.g. when ``job_name_prefix`` includes one) is preserved
+        # intact.
+        server_job_names = {
+            csid.rsplit("-", 1)[0] for csid in data["compute_service_ids"]
+        }
+
+        self.logger.info("Checking health of batch jobs")
+        self.batch_api.check_job_health()
+
+        self.logger.info("Verifying running jobs are registered with server")
+        self.batch_api.verify_running_jobs(server_job_names)
+
+        self.logger.info("Clearing successful jobs")
+        self.batch_api.clear_successful_jobs()
+
 
 class ScriptTemplateHPCManager(HPCManager):
     """HPC manager that submits jobs by rendering a job-script template.
 
     Implements the common ``create_compute_services`` workflow shared by the
-    SLURM/LSF/PBS backends:
-
-    1. Health-check tracked jobs.
-    2. Verify running jobs are registered with the server.
-    3. Clear successful jobs (semantics are backend-specific; see
-       :meth:`HPCBatchApi.clear_successful_jobs`).
-    4. If no jobs are pending, submit up to ``target`` new services. The
-       sizing decision (how many to actually submit) is made upstream in
-       :meth:`alchemiscale.compute.manager.ComputeManager._compute_jobs_to_create`
-       and passed to us as ``target``.
+    SLURM/LSF/PBS backends: if no jobs are pending, submit up to ``target``
+    new services. The sizing decision (how many to actually submit) is made
+    upstream in
+    :meth:`alchemiscale.compute.manager.ComputeManager._compute_jobs_to_create`
+    and passed to us as ``target``. Per-cycle housekeeping happens separately
+    in :meth:`HPCManager.maintain_compute_services`.
 
     Subclasses only need to implement :meth:`_create_job_script`, which renders
     the template into a script ready for ``submit_job``.
@@ -387,8 +455,9 @@ class ScriptTemplateHPCManager(HPCManager):
 
         Called by the parent :class:`ComputeManager` when scaling up is
         warranted. The cycle has already decided how many services to aim
-        for via :meth:`ComputeManager._compute_jobs_to_create`; this method
-        just runs the backend-specific health checks and submits scripts.
+        for via :meth:`ComputeManager._compute_jobs_to_create`, and
+        :meth:`maintain_compute_services` has already run; this method just
+        submits scripts.
 
         If any submitted jobs are still pending in the batch system, this
         method short-circuits to 0 — letting the cluster work through what
@@ -411,23 +480,6 @@ class ScriptTemplateHPCManager(HPCManager):
         int
             Number of new compute services actually created (``<= target``).
         """
-        compute_service_ids = data["compute_service_ids"]
-
-        # Each ComputeServiceID has form "{name}-{uuid_hex}". Strip only the
-        # trailing hex suffix so that service `name` (which may itself contain
-        # hyphens, e.g. when ``job_name_prefix`` includes one) is preserved
-        # intact.
-        server_job_names = {csid.rsplit("-", 1)[0] for csid in compute_service_ids}
-
-        self.logger.info("Checking health of batch jobs")
-        self.batch_api.check_job_health()
-
-        self.logger.info("Verifying running jobs are registered with server")
-        self.batch_api.verify_running_jobs(server_job_names)
-
-        self.logger.info("Clearing successful jobs")
-        self.batch_api.clear_successful_jobs()
-
         if self.batch_api.jobs_pending():
             self.logger.info("Skipping job creation, pending jobs exist")
             return 0
