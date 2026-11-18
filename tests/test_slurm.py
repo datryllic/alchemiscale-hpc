@@ -61,8 +61,8 @@ def test_slurm_settings_extends_script_template_base():
     fields = set(SlurmManagerSettings.model_fields)
     # Inherited from upstream ComputeManagerSettings:
     assert "max_submit_per_cycle" in fields
-    # Inherited from HPCManagerSettings:
-    assert "job_name_prefix" in fields
+    # Removed in favor of ``name`` (see HPCManagerSettings):
+    assert "job_name_prefix" not in fields
     # Inherited from ScriptTemplateHPCManagerSettings:
     assert {
         "job_script_template",
@@ -83,6 +83,60 @@ def test_slurm_settings_extends_script_template_base():
     } <= fields
     # cancel_command was removed when cancel_job left the interface.
     assert "cancel_command" not in fields
+
+
+def _settings_kwargs(tmp_path: Path, **overrides) -> dict:
+    template = tmp_path / "job-template.sh"
+    template.write_text("#!/bin/bash\n")
+    kwargs = dict(
+        name="testmgr",
+        logfile=None,
+        max_compute_services=1,
+        job_script_template=template,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+@pytest.mark.parametrize(
+    "name", ["testmgr", "mycluster.gpu", "my_cluster", "Site:queue.v2", "a"]
+)
+def test_settings_accepts_valid_name(tmp_path: Path, name: str):
+    settings = SlurmManagerSettings(**_settings_kwargs(tmp_path, name=name))
+    assert settings.name == name
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["my-slurm-manager", "1cluster", "_cluster", ".cluster", "my cluster", ""],
+)
+def test_settings_rejects_invalid_name(tmp_path: Path, name: str):
+    """Names that cannot form a valid ComputeServiceID are rejected up front."""
+    with pytest.raises(ValueError, match="alchemiscale compute IDs forbid '-'"):
+        SlurmManagerSettings(**_settings_kwargs(tmp_path, name=name))
+
+
+def test_settings_job_name_prefix_is_deprecated_and_ignored(tmp_path: Path):
+    """Configs that still set ``job_name_prefix`` load, with a warning.
+
+    The prefix is ignored, even an invalid one, since job names are built
+    from ``name``.
+    """
+    with pytest.warns(DeprecationWarning, match="job_name_prefix"):
+        settings = SlurmManagerSettings(
+            **_settings_kwargs(tmp_path, job_name_prefix="my-experiment")
+        )
+    assert not hasattr(settings, "job_name_prefix")
+
+
+def test_generate_job_name_identifies_manager(tmp_path: Path):
+    """Managers with different names produce distinguishable job names."""
+    prefixes = set()
+    for mgr_name in ("mgra", "mgrb"):
+        settings = SlurmManagerSettings(**_settings_kwargs(tmp_path, name=mgr_name))
+        mgr = _build_manager(settings, tmp_path)
+        prefixes.add(mgr._generate_job_name().rsplit(".", 1)[0])
+    assert prefixes == {"mgra", "mgrb"}
 
 
 def test_parse_jobs_handles_empty():
@@ -155,7 +209,7 @@ def test_verify_running_jobs_recognizes_registered(
     """A tracked SLURM job whose name matches a server-known service passes."""
     api = SlurmBatchApi(slurm_settings)
     _track(api, "1")
-    job_name = f"{slurm_settings.job_name_prefix}.deadbeef"
+    job_name = f"{slurm_settings.name}.deadbeef"
     with patch.object(
         api,
         "_get_running_jobs",
@@ -170,7 +224,7 @@ def test_verify_running_jobs_raises_on_unregistered(
     """A tracked, past-grace, running job not in server_job_names triggers."""
     api = SlurmBatchApi(slurm_settings)
     _track(api, "1")
-    job_name = f"{slurm_settings.job_name_prefix}.deadbeef"
+    job_name = f"{slurm_settings.name}.deadbeef"
     with patch.object(
         api,
         "_get_running_jobs",
@@ -183,7 +237,7 @@ def test_verify_running_jobs_raises_on_unregistered(
 def test_verify_running_jobs_ignores_untracked_jobs(
     slurm_settings: SlurmManagerSettings,
 ):
-    """Jobs we did not submit are ignored, even if they share our prefix.
+    """Jobs we did not submit are ignored, even if they share our name.
 
     Regression: the previous implementation filtered by prefix only, which
     meant a second manager (or a stray user job) with the same prefix would
@@ -197,7 +251,7 @@ def test_verify_running_jobs_ignores_untracked_jobs(
         return_value=[
             {
                 "job_id": "1",
-                "name": f"{slurm_settings.job_name_prefix}.fromothermanager",
+                "name": f"{slurm_settings.name}.fromothermanager",
                 "state": "RUNNING",
             }
         ],
@@ -213,7 +267,7 @@ def test_verify_running_jobs_grace_period_skips_young_jobs(
     api = SlurmBatchApi(settings)
     # Track with age=10s; well inside the 600s grace window.
     _track(api, "1", age_seconds=10)
-    job_name = f"{settings.job_name_prefix}.young"
+    job_name = f"{settings.name}.young"
     with patch.object(
         api,
         "_get_running_jobs",
@@ -230,7 +284,7 @@ def test_verify_running_jobs_grace_period_expires(
     settings = slurm_settings.model_copy(update={"job_registration_grace_period": 60})
     api = SlurmBatchApi(settings)
     _track(api, "1", age_seconds=120)
-    job_name = f"{settings.job_name_prefix}.old"
+    job_name = f"{settings.name}.old"
     with patch.object(
         api,
         "_get_running_jobs",
@@ -465,7 +519,7 @@ def test_slurm_manager_render_template(
     script_path = mgr._create_job_script()
     try:
         content = script_path.read_text()
-        assert slurm_settings.job_name_prefix in content
+        assert slurm_settings.name in content
         assert "#SBATCH --partition=testpart" in content
         assert "#SBATCH --account=testacct" in content
         # qos was unset -> empty substitution
@@ -595,7 +649,7 @@ def test_create_compute_services_strips_uuid_suffix_correctly(
 ):
     """server_job_names should strip the trailing ComputeServiceID hex suffix.
 
-    With the standard ``{prefix}.{uuid_hex}`` job name format there is exactly
+    With the standard ``{name}.{uuid_hex}`` job name format there is exactly
     one ``-`` in the resulting ``ComputeServiceID`` (the one separating the
     name from the random hex suffix added by
     ``ComputeServiceID.new_from_name``), so ``rsplit("-", 1)[0]`` recovers
@@ -603,40 +657,7 @@ def test_create_compute_services_strips_uuid_suffix_correctly(
     """
     mgr = _build_manager(slurm_settings, tmp_path)
 
-    service_name = f"{slurm_settings.job_name_prefix}.deadbeef0123456789abcdef01234567"
-    service_id = f"{service_name}-cafebabe0123456789abcdef01234567"
-
-    captured = {}
-
-    def _capture(server_job_names):
-        captured["names"] = server_job_names
-
-    with patch.object(mgr.batch_api, "check_job_health"), patch.object(
-        mgr.batch_api, "verify_running_jobs", side_effect=_capture
-    ), patch.object(mgr.batch_api, "clear_successful_jobs"), patch.object(
-        mgr.batch_api, "jobs_pending", return_value=True
-    ):
-        mgr.create_compute_services(
-            {"compute_service_ids": [service_id], "num_tasks": 0}, target=0
-        )
-
-    assert captured["names"] == {service_name}
-
-
-def test_create_compute_services_handles_dashed_prefix(
-    slurm_settings: SlurmManagerSettings, tmp_path: Path
-):
-    """``rsplit("-", 1)`` still works when ``job_name_prefix`` has hyphens.
-
-    Operators are free to set e.g. ``job_name_prefix: "my-experiment"``;
-    this case has multiple hyphens *before* the trailing uuid_hex, but the
-    rsplit-once logic still recovers the name correctly because there is
-    exactly one separator dash followed by the 32-char hex tail.
-    """
-    settings = slurm_settings.model_copy(update={"job_name_prefix": "my-experiment"})
-    mgr = _build_manager(settings, tmp_path)
-
-    service_name = "my-experiment.deadbeef0123456789abcdef01234567"
+    service_name = f"{slurm_settings.name}.deadbeef0123456789abcdef01234567"
     service_id = f"{service_name}-cafebabe0123456789abcdef01234567"
 
     captured = {}
@@ -657,13 +678,13 @@ def test_create_compute_services_handles_dashed_prefix(
 
 
 def test_generate_job_name_format(slurm_settings: SlurmManagerSettings, tmp_path: Path):
-    """Generated job names are ``{prefix}.{32-char hex}`` (k8s-style)."""
+    """Generated job names are ``{name}.{32-char hex}`` (k8s-style)."""
     mgr = _build_manager(slurm_settings, tmp_path)
 
     name = mgr._generate_job_name()
 
-    prefix = slurm_settings.job_name_prefix
-    # Exactly one separator "." between the prefix and the uuid hex.
+    prefix = slurm_settings.name
+    # Exactly one separator "." between the manager name and the uuid hex.
     assert name.startswith(f"{prefix}.")
     suffix = name[len(prefix) + 1 :]
     # 32-char lowercase hex (uuid4().hex).

@@ -20,7 +20,9 @@ together with :class:`HPCBatchApi` and :class:`ScriptTemplateHPCManagerSettings`
 """
 
 import os
+import re
 import tempfile
+import warnings
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,7 +30,7 @@ from typing import Dict, List, Optional, Set
 from uuid import uuid4
 
 import yaml
-from pydantic import Field
+from pydantic import Field, field_validator, model_validator
 
 from alchemiscale.compute.manager import ComputeManager
 from alchemiscale.compute.settings import ComputeManagerSettings, ComputeServiceSettings
@@ -80,6 +82,13 @@ def list_backends() -> List[str]:
     return sorted(_BACKENDS)
 
 
+# alchemiscale's ``ComputeIDBase`` name rule (``^[a-zA-Z][a-zA-Z0-9_.:]*$``).
+# It applies to the ``ComputeManagerID`` derived from the manager's ``name``,
+# and to the ``ComputeServiceID`` each job registers under its job name
+# ``{name}.{uuid_hex}``; a name satisfying it yields valid job names too.
+_MANAGER_NAME_PATTERN = re.compile(r"[a-zA-Z][a-zA-Z0-9_.:]*")
+
+
 class JobNotFoundError(Exception):
     """Raised when a job is not found in the batch queue."""
 
@@ -95,15 +104,63 @@ class HPCManagerSettings(ComputeManagerSettings):
     with the minimum HPC-specific configuration that every batch backend
     needs. The per-cycle submission cap (``max_submit_per_cycle``) lives on
     the upstream ``ComputeManagerSettings`` and is inherited from there.
+
+    Batch jobs are named ``{name}.{uuid_hex}``, so the manager's ``name``
+    identifies the jobs it submits.
     """
 
-    job_name_prefix: str = Field(
-        "alchemiscale",
-        description=(
-            "Prefix for batch job names. Full name will be "
-            "``<prefix>.<uuid_hex>``."
-        ),
-    )
+    @field_validator("name")
+    @classmethod
+    def _validate_name_for_hpc(cls, value: str) -> str:
+        """Ensure ``name`` can be used to build batch job names.
+
+        The manager names each batch job ``{name}.{uuid4().hex}``, and the
+        compute service in that job registers with the job name as its own
+        name. Both the ``ComputeManagerID`` derived from ``name`` and the
+        ``ComputeServiceID`` derived from the job name must satisfy
+        alchemiscale's ID rules, which forbid '-' and require a leading
+        letter.
+        """
+        if not _MANAGER_NAME_PATTERN.fullmatch(value):
+            raise ValueError(
+                f"name {value!r} is not valid for an HPC compute manager. "
+                "It must start with a letter and contain only letters, digits, "
+                "underscores ('_'), periods ('.'), and colons (':') (e.g. "
+                "'mycluster.gpu'). Batch jobs are named '{name}.{32-character "
+                "hex uuid}', and the compute service in each job registers "
+                "under its job name; alchemiscale compute IDs forbid '-' and "
+                "require a leading letter, so any other name produces compute "
+                "services that cannot register."
+            )
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_job_name_prefix(cls, data):
+        """Backward-compat: ``job_name_prefix`` used to set the job name prefix
+        independently of ``name``.
+
+        Job names are now always built from ``name``, which is required to be
+        distinct across compute managers, so the job name identifies the
+        manager that submitted it. Existing configs that still set
+        ``job_name_prefix`` continue to load; the value is ignored and a
+        :class:`DeprecationWarning` is emitted.
+        """
+        if not isinstance(data, dict):
+            return data
+        if "job_name_prefix" not in data:
+            return data
+
+        data = dict(data)
+        data.pop("job_name_prefix")
+        warnings.warn(
+            f"{cls.__name__}.job_name_prefix is deprecated and ignored; batch "
+            "job names are now built from the manager's name as "
+            "'{name}.{uuid_hex}'.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return data
 
 
 class ScriptTemplateHPCManagerSettings(HPCManagerSettings):
@@ -413,10 +470,8 @@ class ScriptTemplateHPCManager(HPCManager):
         """
         compute_service_ids = data["compute_service_ids"]
 
-        # Each ComputeServiceID has form "{name}-{uuid_hex}". Strip only the
-        # trailing hex suffix so that service `name` (which may itself contain
-        # hyphens, e.g. when ``job_name_prefix`` includes one) is preserved
-        # intact.
+        # Each ComputeServiceID has form "{name}-{uuid_hex}", where `name`
+        # cannot itself contain '-'. Strip the trailing hex suffix.
         server_job_names = {csid.rsplit("-", 1)[0] for csid in compute_service_ids}
 
         self.logger.info("Checking health of batch jobs")
@@ -451,7 +506,7 @@ class ScriptTemplateHPCManager(HPCManager):
         return num_submitted
 
     def _generate_job_name(self) -> str:
-        """Return a unique job name of the form ``{prefix}.{uuid_hex}``.
+        """Return a unique job name of the form ``{name}.{uuid_hex}``.
 
         Uses the same ``.``-separated format as the alchemiscale-k8s reference
         backend (``f"{name}.{uuid4().hex}"``). The UUID portion is the 32-char
@@ -460,7 +515,7 @@ class ScriptTemplateHPCManager(HPCManager):
         only ``-`` is the one separating the service name from the trailing
         hex suffix added by ``ComputeServiceID.new_from_name``.
         """
-        return f"{self.settings.job_name_prefix}.{uuid4().hex}"
+        return f"{self.settings.name}.{uuid4().hex}"
 
     def _render_template(self, substitutions: Dict[str, str]) -> str:
         """Substitute ``{{ KEY }}`` placeholders in the loaded template."""

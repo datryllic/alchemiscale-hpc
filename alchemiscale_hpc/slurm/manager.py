@@ -59,8 +59,8 @@ class SlurmBatchApi(HPCBatchApi):
         """Verify each running tracked SLURM job is registered with the server.
 
         Only jobs whose ``job_id`` is in ``self.tracked_jobs`` are validated.
-        Other jobs sharing the same ``job_name_prefix`` (e.g. from a second
-        manager on the same account or pre-existing user jobs) are ignored.
+        Other jobs with similar names (e.g. pre-existing user jobs) are
+        ignored.
 
         Jobs younger than ``settings.job_registration_grace_period`` seconds
         are also skipped to avoid racing the compute service's registration
