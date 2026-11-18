@@ -134,10 +134,10 @@ class HPCManagerSettings(ComputeManagerSettings):
     identifies the jobs it submits.
     """
 
-    # Value of the deprecated ``job_name_prefix`` if the config set one, so
-    # the manager can repeat the warning in its own log. See
-    # :meth:`_drop_job_name_prefix`.
-    _ignored_job_name_prefix: Optional[str] = PrivateAttr(None)
+    # Warning emitted because the config set the deprecated
+    # ``job_name_prefix`` (to any value, including null), so the manager can
+    # repeat it in its own log. See :meth:`_drop_job_name_prefix`.
+    _job_name_prefix_warning: Optional[str] = PrivateAttr(None)
 
     @field_validator("name")
     @classmethod
@@ -188,15 +188,22 @@ class HPCManagerSettings(ComputeManagerSettings):
         data = dict(data)
         prefix = data.pop("job_name_prefix")
         settings = handler(data)
-        settings._ignored_job_name_prefix = prefix
-        warnings.warn(
-            job_name_prefix_ignored_message(prefix, settings.name), FutureWarning
-        )
+        message = job_name_prefix_ignored_message(prefix, settings.name)
+        settings._job_name_prefix_warning = message
+        warnings.warn(message, FutureWarning)
         return settings
 
 
 def job_name_prefix_ignored_message(prefix, name: str) -> str:
     """Message for a config that still sets the deprecated ``job_name_prefix``."""
+    if prefix is None:
+        # ``job_name_prefix: null`` never loaded before (the field was a
+        # ``str``), so there is no old job name to point to.
+        return (
+            "job_name_prefix=None is deprecated and ignored; batch jobs are "
+            f"named after the manager's name, as '{name}.<uuid_hex>'. Remove "
+            "job_name_prefix from the config."
+        )
     return (
         f"job_name_prefix={prefix!r} is deprecated and ignored; batch jobs are "
         f"now named after the manager's name, as '{name}.<uuid_hex>' instead "
@@ -442,9 +449,9 @@ class HPCManager(ComputeManager, ABC):
         service_settings = ComputeServiceSettings(**service_settings_dict)
         super().__init__(settings=settings, service_settings=service_settings)
 
-        prefix = getattr(settings, "_ignored_job_name_prefix", None)
-        if prefix is not None:
-            self.logger.warning(job_name_prefix_ignored_message(prefix, settings.name))
+        prefix_warning = getattr(settings, "_job_name_prefix_warning", None)
+        if prefix_warning is not None:
+            self.logger.warning(prefix_warning)
 
         # Subclasses provide the concrete batch API via _create_batch_api().
         self.batch_api: HPCBatchApi = self._create_batch_api()

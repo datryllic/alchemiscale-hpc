@@ -137,7 +137,6 @@ def test_settings_job_name_prefix_is_deprecated_and_ignored(tmp_path: Path):
             **_settings_kwargs(tmp_path, job_name_prefix="my-experiment")
         )
     assert not hasattr(settings, "job_name_prefix")
-    assert settings._ignored_job_name_prefix == "my-experiment"
     [warning] = record
     message = str(warning.message)
     assert "job_name_prefix='my-experiment' is deprecated and ignored" in message
@@ -148,7 +147,24 @@ def test_settings_without_job_name_prefix_does_not_warn(tmp_path: Path):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         settings = SlurmManagerSettings(**_settings_kwargs(tmp_path))
-    assert settings._ignored_job_name_prefix is None
+    assert settings._job_name_prefix_warning is None
+
+
+def test_settings_null_job_name_prefix_still_warns(tmp_path: Path, caplog):
+    """An explicit ``job_name_prefix: null`` is still a deprecated setting."""
+    with pytest.warns(FutureWarning) as record:
+        settings = SlurmManagerSettings(
+            **_settings_kwargs(tmp_path, job_name_prefix=None)
+        )
+    [warning] = record
+    message = str(warning.message)
+    assert "job_name_prefix=None is deprecated and ignored" in message
+    assert "'testmgr.<uuid_hex>'" in message
+    assert "None.<uuid_hex>" not in message
+
+    with caplog.at_level("WARNING", logger="AlchemiscaleComputeManager"):
+        _build_manager(settings, tmp_path)
+    assert "job_name_prefix=None is deprecated and ignored" in caplog.text
 
 
 def test_manager_logs_ignored_job_name_prefix(tmp_path: Path, caplog):
