@@ -101,7 +101,7 @@ class HPCManagerSettings(ComputeManagerSettings):
         "alchemiscale",
         description=(
             "Prefix for batch job names. Full name will be "
-            "``<prefix>.<uuid_hex>`` (matches the alchemiscale-k8s convention)."
+            "``<prefix>.<uuid_hex>``."
         ),
     )
 
