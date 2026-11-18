@@ -1,0 +1,17 @@
+name: alchemiscale-hpc-test
+channels:
+  - conda-forge
+
+dependencies:
+  - pip
+
+  # alchemiscale compute-side release that includes upstream sizing logic
+  # (OpenFreeEnergy/alchemiscale#502, first released in v0.8.0)
+  - alchemiscale-compute =0.8.1
+
+  # alchemiscale-hpc deps
+  - click
+  - pyyaml
+
+  # testing
+  - pytest
