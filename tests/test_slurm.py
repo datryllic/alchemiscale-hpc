@@ -8,7 +8,6 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
-from alchemiscale.storage.models import ComputeManagerID, ComputeServiceID
 from alchemiscale.storage.models import ComputeManagerInstruction
 
 from alchemiscale_hpc import (
@@ -111,10 +110,6 @@ def _settings_kwargs(tmp_path: Path, **overrides) -> dict:
 def test_settings_accepts_valid_name(tmp_path: Path, name: str):
     settings = SlurmManagerSettings(**_settings_kwargs(tmp_path, name=name))
     assert settings.name == name
-    # Catch drift from upstream's ID rules: names we accept must yield IDs
-    # alchemiscale accepts, for both the manager and its jobs' services.
-    ComputeManagerID.new_from_name(name)
-    ComputeServiceID.new_from_name(make_job_name(name))
 
 
 @pytest.mark.parametrize(

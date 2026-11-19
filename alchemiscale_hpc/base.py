@@ -36,7 +36,11 @@ from pydantic import Field, PrivateAttr, field_validator, model_validator
 
 from alchemiscale.compute.manager import ComputeManager
 from alchemiscale.compute.settings import ComputeManagerSettings, ComputeServiceSettings
-from alchemiscale.storage.models import ComputeManagerInstruction
+from alchemiscale.storage.models import (
+    ComputeManagerID,
+    ComputeManagerInstruction,
+    ComputeServiceID,
+)
 
 # Matches any ``{{ ... }}`` token, whatever its spacing (including newlines), so
 # that near-misses like ``{{JOB_NAME}}`` are reported along with unknown names.
@@ -95,13 +99,6 @@ def get_backend(name: str) -> tuple:
 def list_backends() -> List[str]:
     """Return the names of all registered backends."""
     return sorted(_BACKENDS)
-
-
-# alchemiscale's ``ComputeIDBase`` name rule (``^[a-zA-Z][a-zA-Z0-9_.:]*$``).
-# It applies to the ``ComputeManagerID`` derived from the manager's ``name``,
-# and to the ``ComputeServiceID`` each job registers under its job name
-# ``{name}.{uuid_hex}``; a name satisfying it yields valid job names too.
-_MANAGER_NAME_PATTERN = re.compile(r"[a-zA-Z][a-zA-Z0-9_.:]*")
 
 
 def make_job_name(manager_name: str) -> str:
@@ -165,8 +162,16 @@ class HPCManagerSettings(ComputeManagerSettings):
         ``ComputeServiceID`` derived from the job name must satisfy
         alchemiscale's ID rules, which forbid '-' and require a leading
         letter.
+
+        The rules are checked by building both IDs, so they stay upstream's.
+        alchemiscale only checks them when the manager is constructed;
+        OpenFreeEnergy/alchemiscale#539 proposes checking them in its settings
+        models, after which this validator only needs to explain job naming.
         """
-        if not _MANAGER_NAME_PATTERN.fullmatch(value):
+        try:
+            ComputeManagerID.new_from_name(value)
+            ComputeServiceID.new_from_name(make_job_name(value))
+        except ValueError as e:
             raise ValueError(
                 f"name {value!r} is not valid for an HPC compute manager. "
                 "It must start with a letter and contain only letters, digits, "
@@ -176,7 +181,7 @@ class HPCManagerSettings(ComputeManagerSettings):
                 "under its job name; alchemiscale compute IDs forbid '-' and "
                 "require a leading letter, so any other name produces compute "
                 "services that cannot register."
-            )
+            ) from e
         return value
 
     @model_validator(mode="wrap")
