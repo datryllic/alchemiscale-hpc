@@ -53,7 +53,7 @@ SERVICE_CONFIG="/path/to/compute-service-settings.yaml"
 #
 # `--name "{{ JOB_NAME }}"` overrides the `name` field in the service config so
 # that the registered ComputeServiceID matches the SLURM job name. This is
-# REQUIRED for the manager's `verify_running_jobs` health check to work.
+# REQUIRED for the manager's check that running jobs are registered.
 #
 # `--compute-manager-id "{{ COMPUTE_MANAGER_ID }}"` records the manager that
 # launched this service for provenance.
@@ -67,7 +67,13 @@ alchemiscale compute synchronous \
     -c "$SERVICE_CONFIG" \
     --name "{{ JOB_NAME }}" \
     --compute-manager-id "{{ COMPUTE_MANAGER_ID }}"
+# Capture the service's exit status right away. The job must exit with it:
+# SLURM records a job that exits 0 as COMPLETED, which the manager takes as
+# a sign of health, so a service that failed to start (command not found,
+# wrong environment, bad service config) must not end the job with status 0.
+status=$?
 
 # Job completion
 echo "End Time: $(date)"
-echo "Job completed successfully"
+echo "Compute service exited with status $status"
+exit $status

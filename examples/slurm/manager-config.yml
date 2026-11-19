@@ -45,12 +45,30 @@ sleep_interval: 900  # 15 minutes
 # Increase this to scale up faster, but be cautious of overwhelming SLURM.
 max_submit_per_cycle: 2
 
-# Seconds to wait after submitting a job before treating it as "should be
-# registered with the alchemiscale server" (default: 120). Bumping this avoids
-# spurious JobNotFoundError on busy clusters where compute services take a
-# while to register; lowering it makes the manager catch real registration
+# Seconds a job may be RUNNING without being registered with the alchemiscale
+# server (default: 120). Measured from when the job started running, not from
+# submission, so time spent pending does not count. A running job found
+# unregistered after this is logged and checked again next cycle; the manager
+# stops with JobNotFoundError only if the job is still unregistered on a later
+# check at least this many seconds after it was first found. Bumping this
+# avoids spurious JobNotFoundError on busy clusters where compute services take
+# a while to register; lowering it makes the manager catch real registration
 # failures faster.
 job_registration_grace_period: 120
+
+# Failed jobs (FAILED, TIMEOUT, CANCELLED, NODE_FAIL, PREEMPTED,
+# OUT_OF_MEMORY, BOOT_FAIL, DEADLINE) are logged with their reason and dropped
+# from tracking whenever the manager checks its jobs. The manager stops with
+# JobFailureError only if failed jobs are found in more than this many checks
+# with no sign of a healthy job in between (one of its jobs completing, or
+# one of its compute services registered with the server), which usually
+# means a broken job script template or settings. Likewise, it stops with
+# JobSubmissionError if every submission fails in more than this many cycles
+# while none of its services is registered (e.g. a wrong partition, account,
+# or QoS). With a short sleep_interval, raise this so that a brief slurmctld
+# outage does not stop the manager. 0 stops on the first failure; null never
+# stops. Default: 5.
+max_consecutive_failed_cycles: 5
 
 # Cleanup settings
 #
@@ -63,8 +81,8 @@ job_registration_grace_period: 120
 # Run the per-cycle clear_successful_jobs step (default: true).
 cleanup_successful_jobs: true
 
-# Let clear_failed_jobs untrack failed jobs (default: true).
-cleanup_failed_jobs: true
+# cleanup_failed_jobs is ignored, and setting it to false warns: failed jobs
+# are always logged once and dropped from tracking.
 
 # Job script handling
 

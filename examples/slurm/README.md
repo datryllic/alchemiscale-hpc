@@ -79,7 +79,8 @@ The manager will:
 1. Register with the alchemiscale compute API
 2. Periodically check for available tasks
 3. Submit SLURM jobs when tasks are waiting and capacity is available
-4. Monitor job health and cleanup completed/failed jobs
+4. Log failed jobs with their reasons, and stop tracking completed and
+   failed jobs
 5. Report status back to the server
 
 ### 5. Monitor the Manager
@@ -124,6 +125,50 @@ alchemiscale-hpc slurm clear-error \
     -s my-service-config.yml
 ```
 
+### Failed Jobs
+
+A failed job (`FAILED`, `TIMEOUT`, `CANCELLED`, `NODE_FAIL`, `PREEMPTED`,
+`OUT_OF_MEMORY`, `BOOT_FAIL`, `DEADLINE`) does not stop the manager. Each
+cycle that checks its jobs, the manager logs every newly failed job at ERROR
+with its `sacct` state and exit code (and last pending reason, if any), for
+example:
+
+```
+Batch job 4242 failed: CANCELLED by 1000, exit code 0, signal 15
+```
+
+and stops tracking it. The manager stops with `JobFailureError` only if
+failed jobs are found in more than `max_consecutive_failed_cycles` (default
+5) checks with no sign of a healthy job in between: one of its jobs
+completing, or one of its compute services registered with the server.
+Checks that only see pending jobs neither count nor reset. So routine
+preemptions and timeouts in a working fleet never stop the manager, while
+jobs that fail without ever registering do, even if they pend first. After
+a change that breaks the template, an older service of this manager that is
+still registered keeps resetting the count until it ends (up to its
+walltime); only then does the limit apply. The new jobs' failures are
+logged at ERROR throughout.
+
+Your job script must exit with the compute service's exit status, as the
+example template does: a job that exits 0 is recorded as `COMPLETED`, which
+counts as a sign of health, so a service that never started would otherwise
+keep the manager resubmitting.
+
+Likewise, it stops with `JobSubmissionError` if every `sbatch` fails in more
+than that many cycles while none of its compute services is registered;
+failures at a submit limit (e.g. `MaxSubmitJobsPerUser`) with a running
+fleet do not count. The error includes `sbatch`'s message. Either error
+usually means a broken job script template or settings (partition, account,
+QoS). With a short `sleep_interval`, raise the limit so that a brief
+`slurmctld` outage does not stop the manager.
+
+A running job that is not registered with the server, past
+`job_registration_grace_period` from when it started, is logged at WARNING
+and checked again next cycle: a job can stay RUNNING briefly after its
+compute service deregisters. The manager stops with `JobNotFoundError` only
+if the job is still unregistered on a later check at least
+`job_registration_grace_period` seconds after it was first found.
+
 ### Show the Manager's Jobs
 
 List the manager's queued and running jobs:
@@ -146,11 +191,22 @@ debugging), set `keep_job_scripts: true` in the manager config.
 
 ### Restarting After an Error
 
-On startup, the manager recovers its jobs that are still in the SLURM queue,
-with their original submission times. Restarting therefore does not clear a
-halt caused by a running job that never registered with the server
-(`JobNotFoundError`): the first cycle finds the same job and halts again,
-until the job ends or you cancel it with `scancel`.
+On startup, the manager recovers its jobs that are still in the SLURM queue;
+if `squeue` fails, it does not start. It then recovers its jobs that
+finished in the last 7 days from `sacct`, and logs one WARNING with the
+number that failed (including ones already reported before the restart),
+with each job and its reason at INFO. These do not count toward
+`max_consecutive_failed_cycles`. If `sacct` fails (e.g. accounting is
+disabled), it logs a WARNING and starts anyway.
+
+Fix the cause named in the manager log before restarting; if the manager is
+still in ERROR state on the server, clear it first (see
+[Clear Error Status](#clear-error-status)).
+
+A restart does not forget a running job that is not registered with the
+server: it is recovered and, after a check and a re-check, stops the manager
+with `JobNotFoundError` again, until the job ends or you cancel it with
+`scancel`.
 
 ## How It Works
 
@@ -207,10 +263,11 @@ until the job ends or you cancel it with `scancel`.
    - Service registers with API
    - Claims and executes tasks
    - Deregisters when done (max tasks/time reached or no more tasks)
-6. **Manager tracks** job IDs and cleans up completed/failed jobs. On
-   startup, it recovers its queued jobs from `squeue` by job name, so a
-   restarted manager does not submit on top of jobs that are still pending.
-   This is why managers under the same cluster user need different names.
+6. **Manager tracks** job IDs, logs failed jobs with their reasons, and
+   stops tracking completed and failed jobs. On startup, it recovers its jobs
+   from `squeue` and `sacct` by job name, so a restarted manager does not
+   submit on top of jobs that are still pending. This is why managers under the
+   same cluster user need different names.
 
 ### Job Lifecycle
 
@@ -223,7 +280,9 @@ until the job ends or you cancel it with `scancel`.
 - **PENDING**: Job is queued in SLURM, waiting for resources
 - **RUNNING**: Job is executing, compute service is active
 - **COMPLETED**: Job finished successfully, service deregistered
-- **FAILED**: Job failed, manager raises alert
+- **FAILED** (or `TIMEOUT`, `CANCELLED`, `NODE_FAIL`, `PREEMPTED`): manager
+  logs the reason and carries on; it stops only if jobs fail cycle after cycle
+  (see [Failed Jobs](#failed-jobs))
 
 ## Troubleshooting
 
