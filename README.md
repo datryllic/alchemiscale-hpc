@@ -115,7 +115,9 @@ The package uses a modular architecture with two abstraction layers:
 
 1. **Bare base interfaces** (`base.py`): Enforced via `abc.ABC`.
    - `HPCManager`: minimal manager contract (`_create_batch_api`,
-     `create_compute_services`). Extends alchemiscale's `ComputeManager`.
+     `create_compute_services`). Extends alchemiscale's `ComputeManager`,
+     running backend housekeeping (`maintain_compute_services`: health
+     checks, server reconciliation, clearing finished jobs) every cycle.
    - `HPCBatchApi`: abstract interface for batch system commands
      (`submit_job`, `get_jobs`, `check_job_health`,
      `clear_successful_jobs`, `clear_failed_jobs`, ...).
@@ -128,7 +130,8 @@ The package uses a modular architecture with two abstraction layers:
 2. **Script-template convenience layer** (`base.py`): the workflow shared
    by SLURM/LSF/PBS.
    - `ScriptTemplateHPCManager(HPCManager)`: implements
-     `create_compute_services` as "render template → submit → cleanup".
+     `create_compute_services` as "render template → submit → cleanup",
+     gated only on no jobs pending.
      Subclasses only implement `_create_batch_api` and `_create_job_script`.
    - `ScriptTemplateHPCManagerSettings(HPCManagerSettings)`: adds
      `job_script_template`, `job_script_dir`, `keep_job_scripts`,

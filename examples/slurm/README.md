@@ -42,7 +42,7 @@ cp examples/slurm/service-config.yml my-service-config.yml
   alchemiscale servers; the server only rejects duplicates among managers
   registered with it
 - Set `job_script_template` to the path of your job template
-- Configure `partition`, `account`, `qos` for your SLURM system
+- Configure `partition`, `account`, `qos` for your SLURM system; the manager passes them to `sbatch` on the command line, overriding matching `#SBATCH` directives in the template
 - Set `max_compute_services` based on your resource allocation
 - Adjust `sleep_interval` and `max_submit_per_cycle` for your scaling needs
 - Set `logfile` path
