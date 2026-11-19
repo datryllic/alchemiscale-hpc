@@ -20,11 +20,12 @@ together with :class:`HPCBatchApi` and :class:`ScriptTemplateHPCManagerSettings`
 """
 
 import os
+import re
 import tempfile
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import ClassVar, Dict, FrozenSet, List, Optional, Set
 from uuid import uuid4
 
 import yaml
@@ -32,6 +33,18 @@ from pydantic import Field
 
 from alchemiscale.compute.manager import ComputeManager
 from alchemiscale.compute.settings import ComputeManagerSettings, ComputeServiceSettings
+
+# Matches any ``{{ ... }}`` token, whatever its spacing (including newlines), so
+# that near-misses like ``{{JOB_NAME}}`` are reported along with unknown names.
+# Extra surrounding braces are not flagged: ``{{{ JOB_NAME }}}`` passes
+# validation but renders as ``{<job name>}``.
+_TEMPLATE_TOKEN = re.compile(r"\{\{[^{}]*\}\}")
+
+
+def _placeholder(key: str) -> str:
+    """Return the exact ``{{ KEY }}`` form that the manager substitutes."""
+    return f"{{{{ {key} }}}}"
+
 
 # Registry of available backends, populated by backend modules at import time.
 # Maps backend name (e.g. "slurm") -> (Manager class, Settings class, BatchApi class).
@@ -367,10 +380,24 @@ class ScriptTemplateHPCManager(HPCManager):
        and passed to us as ``target``.
 
     Subclasses only need to implement :meth:`_create_job_script`, which renders
-    the template into a script ready for ``submit_job``.
+    the template into a script ready for ``submit_job``, and extend
+    :attr:`TEMPLATE_PLACEHOLDERS` with any backend-specific placeholders.
     """
 
     settings: ScriptTemplateHPCManagerSettings
+
+    #: Placeholders every job script template must contain. Without them, jobs
+    #: run but their compute services never register with the server under
+    #: the expected name.
+    REQUIRED_TEMPLATE_PLACEHOLDERS: ClassVar[FrozenSet[str]] = frozenset(
+        {"JOB_NAME", "COMPUTE_MANAGER_ID"}
+    )
+
+    #: Every placeholder the backend substitutes. Used both to validate the
+    #: template at construction and to check the keys passed to
+    #: :meth:`_render_template`, so a mismatch between them is caught on the
+    #: first render (and in tests).
+    TEMPLATE_PLACEHOLDERS: ClassVar[FrozenSet[str]] = REQUIRED_TEMPLATE_PLACEHOLDERS
 
     def __init__(
         self,
@@ -381,6 +408,8 @@ class ScriptTemplateHPCManager(HPCManager):
 
         with open(self.settings.job_script_template, "r") as f:
             self.job_script_template: str = f.read()
+        # fail fast on a bad template, rather than on the first submission
+        self._validate_template()
 
     def create_compute_services(self, data: dict, target: int) -> int:
         """Create up to ``target`` compute services by submitting batch jobs.
@@ -462,11 +491,57 @@ class ScriptTemplateHPCManager(HPCManager):
         """
         return f"{self.settings.job_name_prefix}.{uuid4().hex}"
 
+    def _validate_template(self) -> None:
+        """Check the loaded template against the declared placeholders.
+
+        Any other ``{{ ... }}`` token would be left in the rendered script
+        unchanged, so it is logged as a warning.
+
+        Raises
+        ------
+        ValueError
+            If any of :attr:`REQUIRED_TEMPLATE_PLACEHOLDERS` is missing.
+        """
+        template = self.job_script_template
+        path = self.settings.job_script_template
+
+        missing = sorted(
+            _placeholder(key)
+            for key in self.REQUIRED_TEMPLATE_PLACEHOLDERS
+            if _placeholder(key) not in template
+        )
+        if missing:
+            raise ValueError(
+                f"Job script template {path} is missing required placeholder(s) "
+                f"{', '.join(missing)}; jobs would not register with the server. "
+                "Pass them to `alchemiscale compute synchronous "
+                '--name "{{ JOB_NAME }}" '
+                '--compute-manager-id "{{ COMPUTE_MANAGER_ID }}"`.'
+            )
+
+        known = sorted(_placeholder(key) for key in self.TEMPLATE_PLACEHOLDERS)
+        unknown = sorted(set(_TEMPLATE_TOKEN.findall(template)) - set(known))
+        for token in unknown:
+            self.logger.warning(
+                f"Job script template {path}: {token} is not a known placeholder "
+                f"and will be left unchanged. Known placeholders: {', '.join(known)}"
+            )
+
     def _render_template(self, substitutions: Dict[str, str]) -> str:
-        """Substitute ``{{ KEY }}`` placeholders in the loaded template."""
+        """Substitute ``{{ KEY }}`` placeholders in the loaded template.
+
+        ``substitutions`` must have exactly the keys in
+        :attr:`TEMPLATE_PLACEHOLDERS`.
+        """
+        if set(substitutions) != self.TEMPLATE_PLACEHOLDERS:
+            raise ValueError(
+                f"Substitution keys {sorted(substitutions)} do not match "
+                f"{type(self).__name__}.TEMPLATE_PLACEHOLDERS "
+                f"{sorted(self.TEMPLATE_PLACEHOLDERS)}"
+            )
         rendered = self.job_script_template
         for key, value in substitutions.items():
-            rendered = rendered.replace(f"{{{{ {key} }}}}", value)
+            rendered = rendered.replace(_placeholder(key), value)
         return rendered
 
     def _write_job_script(self, content: str, job_name: str) -> Path:

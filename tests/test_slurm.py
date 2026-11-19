@@ -24,7 +24,6 @@ def slurm_settings(tmp_path: Path) -> SlurmManagerSettings:
     template = tmp_path / "job-template.sh"
     template.write_text(
         "#!/bin/bash\n#SBATCH --job-name={{ JOB_NAME }}\n"
-        "{{ PARTITION }}\n{{ ACCOUNT }}\n{{ QOS }}\n"
         "echo manager={{ COMPUTE_MANAGER_ID }}\n"
     )
     return SlurmManagerSettings(
@@ -402,6 +401,27 @@ def test_submit_job_parses_sbatch_output_and_tracks(
     assert "99999" in api._submission_times
 
 
+def test_submit_job_passes_partition_account_qos(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """Set options are passed to sbatch before the script; unset ones are not."""
+    api = SlurmBatchApi(slurm_settings)
+    fake = type(
+        "R",
+        (),
+        {"stdout": "Submitted batch job 1\n", "stderr": "", "returncode": 0},
+    )
+    script = tmp_path / "script.sh"
+    with patch("subprocess.run", return_value=fake) as run:
+        api.submit_job(script)
+    assert run.call_args.args[0] == [
+        "sbatch",
+        "--partition=testpart",
+        "--account=testacct",
+        str(script),
+    ]
+
+
 def test_submit_job_raises_on_unparseable_output(
     slurm_settings: SlurmManagerSettings, tmp_path: Path
 ):
@@ -466,10 +486,8 @@ def test_slurm_manager_render_template(
     try:
         content = script_path.read_text()
         assert slurm_settings.job_name_prefix in content
-        assert "#SBATCH --partition=testpart" in content
-        assert "#SBATCH --account=testacct" in content
-        # qos was unset -> empty substitution
-        assert "{{ QOS }}" not in content
+        # partition/account/qos are passed to sbatch, not rendered
+        assert "--partition" not in content
         # COMPUTE_MANAGER_ID substituted
         assert "{{ COMPUTE_MANAGER_ID }}" not in content
     finally:
@@ -670,3 +688,92 @@ def test_generate_job_name_format(slurm_settings: SlurmManagerSettings, tmp_path
     assert re.fullmatch(r"[0-9a-f]{32}", suffix), suffix
     # Each call yields a fresh uuid.
     assert name != mgr._generate_job_name()
+
+
+# ----------------------------------------------------------------------
+# Job script template validation
+# ----------------------------------------------------------------------
+
+EXAMPLE_TEMPLATE = (
+    Path(__file__).resolve().parent.parent / "examples" / "slurm" / "job-template.sh"
+)
+
+
+@pytest.mark.parametrize("missing", ["JOB_NAME", "COMPUTE_MANAGER_ID"])
+def test_template_missing_required_placeholder_raises(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, missing: str
+):
+    """A template without a required placeholder is rejected at construction."""
+    template = slurm_settings.job_script_template
+    template.write_text(template.read_text().replace(f"{{{{ {missing} }}}}", "x"))
+
+    with pytest.raises(ValueError, match=f"missing required placeholder.*{missing}"):
+        _build_manager(slurm_settings, tmp_path)
+
+
+def test_template_unknown_placeholder_warns(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, caplog
+):
+    """Unknown or mis-spaced ``{{ ... }}`` tokens are logged as warnings."""
+    template = slurm_settings.job_script_template
+    template.write_text(
+        template.read_text()
+        + "{{ PARITION }}\necho {{JOB_NAME}}\necho {{ JOB_NAME\n}}\n"
+    )
+
+    with caplog.at_level("WARNING"):
+        _build_manager(slurm_settings, tmp_path)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 3
+    assert any("{{ PARITION }}" in w for w in warnings)
+    assert any("{{JOB_NAME}}" in w for w in warnings)
+    assert any("{{ JOB_NAME\n}}" in w for w in warnings)
+
+
+@pytest.mark.parametrize(
+    "token", ["{{ PARTITION }}", "{{ACCOUNT}}", "#SBATCH --qos={{ QOS }}"]
+)
+def test_template_removed_placeholder_raises(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, token: str
+):
+    """Templates using the old PARTITION/ACCOUNT/QOS placeholders are rejected."""
+    template = slurm_settings.job_script_template
+    template.write_text(template.read_text() + token + "\n")
+
+    with pytest.raises(ValueError, match="no longer substituted"):
+        _build_manager(slurm_settings, tmp_path)
+
+
+def test_example_template_validates_cleanly(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, caplog
+):
+    """The bundled example template passes validation without warnings and
+    renders with no placeholders left over."""
+    settings = slurm_settings.model_copy(
+        update={"job_script_template": EXAMPLE_TEMPLATE}
+    )
+
+    with caplog.at_level("WARNING"):
+        mgr = _build_manager(settings, tmp_path)
+
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    script_path = mgr._create_job_script()
+    try:
+        assert "{{" not in script_path.read_text()
+    finally:
+        script_path.unlink(missing_ok=True)
+
+
+def test_render_template_rejects_undeclared_substitutions(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """Substitution keys must match ``TEMPLATE_PLACEHOLDERS`` exactly."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    substitutions = dict.fromkeys(SlurmManager.TEMPLATE_PLACEHOLDERS, "")
+
+    with pytest.raises(ValueError, match="TEMPLATE_PLACEHOLDERS"):
+        mgr._render_template({**substitutions, "EXTRA": ""})
+    with pytest.raises(ValueError, match="TEMPLATE_PLACEHOLDERS"):
+        mgr._render_template({k: v for k, v in substitutions.items() if k != "JOB_NAME"})
