@@ -1,8 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name={{ JOB_NAME }}
-{{ PARTITION }}
-{{ ACCOUNT }}
-{{ QOS }}
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
@@ -21,10 +18,8 @@
 #   {{ JOB_NAME }}            - Unique job name (auto-generated)
 #   {{ COMPUTE_MANAGER_ID }}  - Manager ID for provenance tracking
 #
-# Optional placeholders:
-#   {{ PARTITION }}           - SLURM partition directive (can be empty)
-#   {{ ACCOUNT }}             - SLURM account directive (can be empty)
-#   {{ QOS }}                 - SLURM QOS directive (can be empty)
+# The manager passes the `partition`, `account` and `qos` settings to sbatch on
+# the command line, where they override any matching directives here.
 #
 # Customize the resource requests above (#SBATCH directives) for your HPC system.
 
