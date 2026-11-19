@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from alchemiscale.storage.models import ComputeManagerInstruction
 
 from alchemiscale_hpc import (
     HPCBatchApi,
@@ -463,10 +464,17 @@ def _build_manager(
     )
     # Bypass network/registration in ComputeManager.__init__ by patching the
     # client constructor it triggers.
-    with patch("alchemiscale.compute.manager.AlchemiscaleComputeManagerClient"):
-        return SlurmManager(
+    # ``autospec`` so upstream signature drift in e.g. ``get_instruction`` or
+    # ``update_status`` fails these tests.
+    with patch(
+        "alchemiscale.compute.manager.AlchemiscaleComputeManagerClient", autospec=True
+    ):
+        mgr = SlurmManager(
             settings=slurm_settings, service_settings_path=service_config
         )
+    # Instance attribute set in the real client's __init__; autospec can't see it.
+    mgr.client.api_url = "http://example.com"
+    return mgr
 
 
 def test_slurm_manager_create_batch_api_factory(
@@ -506,13 +514,9 @@ def test_slurm_manager_create_compute_services_cleans_up_scripts(
         submitted_paths.append(path)
         return "12345"
 
-    with patch.object(mgr.batch_api, "check_job_health"), patch.object(
-        mgr.batch_api, "verify_running_jobs"
-    ), patch.object(mgr.batch_api, "clear_successful_jobs"), patch.object(
+    with patch.object(
         mgr.batch_api, "jobs_pending", return_value=False
-    ), patch.object(
-        mgr.batch_api, "submit_job", side_effect=_fake_submit
-    ):
+    ), patch.object(mgr.batch_api, "submit_job", side_effect=_fake_submit):
         n = mgr.create_compute_services(
             {"compute_service_ids": [], "num_tasks": 1}, target=1
         )
@@ -536,13 +540,9 @@ def test_slurm_manager_keep_job_scripts(
         submitted_paths.append(path)
         return "12345"
 
-    with patch.object(mgr.batch_api, "check_job_health"), patch.object(
-        mgr.batch_api, "verify_running_jobs"
-    ), patch.object(mgr.batch_api, "clear_successful_jobs"), patch.object(
+    with patch.object(
         mgr.batch_api, "jobs_pending", return_value=False
-    ), patch.object(
-        mgr.batch_api, "submit_job", side_effect=_fake_submit
-    ):
+    ), patch.object(mgr.batch_api, "submit_job", side_effect=_fake_submit):
         mgr.create_compute_services(
             {"compute_service_ids": [], "num_tasks": 1}, target=1
         )
@@ -574,13 +574,9 @@ def test_create_compute_services_honors_target(
         submitted.append(path)
         return f"id-{len(submitted)}"
 
-    with patch.object(mgr.batch_api, "check_job_health"), patch.object(
-        mgr.batch_api, "verify_running_jobs"
-    ), patch.object(mgr.batch_api, "clear_successful_jobs"), patch.object(
+    with patch.object(
         mgr.batch_api, "jobs_pending", return_value=False
-    ), patch.object(
-        mgr.batch_api, "submit_job", side_effect=_fake_submit
-    ):
+    ), patch.object(mgr.batch_api, "submit_job", side_effect=_fake_submit):
         n = mgr.create_compute_services(
             {"compute_service_ids": [], "num_tasks": 100}, target=3
         )
@@ -594,13 +590,9 @@ def test_create_compute_services_skips_when_pending(
     """Backend gate: if any submitted jobs are still pending, do nothing
     even when ``target`` says to scale up."""
     mgr = _build_manager(slurm_settings, tmp_path)
-    with patch.object(mgr.batch_api, "check_job_health"), patch.object(
-        mgr.batch_api, "verify_running_jobs"
-    ), patch.object(mgr.batch_api, "clear_successful_jobs"), patch.object(
+    with patch.object(
         mgr.batch_api, "jobs_pending", return_value=True
-    ), patch.object(
-        mgr.batch_api, "submit_job"
-    ) as submit:
+    ), patch.object(mgr.batch_api, "submit_job") as submit:
         n = mgr.create_compute_services(
             {"compute_service_ids": [], "num_tasks": 5}, target=5
         )
@@ -608,7 +600,7 @@ def test_create_compute_services_skips_when_pending(
     submit.assert_not_called()
 
 
-def test_create_compute_services_strips_uuid_suffix_correctly(
+def test_maintain_compute_services_strips_uuid_suffix_correctly(
     slurm_settings: SlurmManagerSettings, tmp_path: Path
 ):
     """server_job_names should strip the trailing ComputeServiceID hex suffix.
@@ -631,17 +623,15 @@ def test_create_compute_services_strips_uuid_suffix_correctly(
 
     with patch.object(mgr.batch_api, "check_job_health"), patch.object(
         mgr.batch_api, "verify_running_jobs", side_effect=_capture
-    ), patch.object(mgr.batch_api, "clear_successful_jobs"), patch.object(
-        mgr.batch_api, "jobs_pending", return_value=True
-    ):
-        mgr.create_compute_services(
-            {"compute_service_ids": [service_id], "num_tasks": 0}, target=0
+    ), patch.object(mgr.batch_api, "clear_successful_jobs"):
+        mgr.maintain_compute_services(
+            {"compute_service_ids": [service_id], "num_tasks": 0}
         )
 
     assert captured["names"] == {service_name}
 
 
-def test_create_compute_services_handles_dashed_prefix(
+def test_maintain_compute_services_handles_dashed_prefix(
     slurm_settings: SlurmManagerSettings, tmp_path: Path
 ):
     """``rsplit("-", 1)`` still works when ``job_name_prefix`` has hyphens.
@@ -664,14 +654,234 @@ def test_create_compute_services_handles_dashed_prefix(
 
     with patch.object(mgr.batch_api, "check_job_health"), patch.object(
         mgr.batch_api, "verify_running_jobs", side_effect=_capture
-    ), patch.object(mgr.batch_api, "clear_successful_jobs"), patch.object(
-        mgr.batch_api, "jobs_pending", return_value=True
-    ):
-        mgr.create_compute_services(
-            {"compute_service_ids": [service_id], "num_tasks": 0}, target=0
+    ), patch.object(mgr.batch_api, "clear_successful_jobs"):
+        mgr.maintain_compute_services(
+            {"compute_service_ids": [service_id], "num_tasks": 0}
         )
 
     assert captured["names"] == {service_name}
+
+
+def test_create_compute_services_does_not_run_maintenance(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """``create_compute_services`` only submits; housekeeping lives in
+    ``maintain_compute_services``."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    with patch.object(mgr, "maintain_compute_services") as maintain, patch.object(
+        mgr.batch_api, "check_job_health"
+    ) as health, patch.object(
+        mgr.batch_api, "verify_running_jobs"
+    ) as verify, patch.object(
+        mgr.batch_api, "clear_successful_jobs"
+    ) as clear, patch.object(
+        mgr.batch_api, "jobs_pending", return_value=False
+    ), patch.object(
+        mgr.batch_api, "submit_job", return_value="1"
+    ):
+        mgr.create_compute_services(
+            {"compute_service_ids": [], "num_tasks": 1}, target=1
+        )
+    maintain.assert_not_called()
+    health.assert_not_called()
+    verify.assert_not_called()
+    clear.assert_not_called()
+
+
+# ----------------------------------------------------------------------
+# cycle(): maintenance runs every OK/SKIP cycle, independent of scale-up
+# ----------------------------------------------------------------------
+
+
+def test_cycle_runs_maintenance_with_no_tasks(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """An OK instruction with ``num_tasks=0`` never reaches
+    ``create_compute_services`` upstream, but maintenance still runs."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    service_name = f"{slurm_settings.job_name_prefix}.deadbeef0123456789abcdef01234567"
+    service_id = f"{service_name}-cafebabe0123456789abcdef01234567"
+    mgr.client.get_instruction.return_value = (
+        ComputeManagerInstruction.OK,
+        {"compute_service_ids": [service_id], "num_tasks": 0},
+    )
+
+    with patch.object(mgr.batch_api, "check_job_health") as health, patch.object(
+        mgr.batch_api, "verify_running_jobs"
+    ) as verify, patch.object(
+        mgr.batch_api, "clear_successful_jobs"
+    ) as clear, patch.object(
+        mgr, "create_compute_services"
+    ) as create:
+        assert mgr.cycle() is True
+
+    health.assert_called_once_with()
+    verify.assert_called_once_with({service_name})
+    clear.assert_called_once_with()
+    create.assert_not_called()
+    mgr.client.update_status.assert_called_once()
+
+
+def test_cycle_runs_maintenance_at_capacity(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """At ``max_compute_services`` upstream skips scale-up; maintenance runs."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    ids = [f"svc.{i:032x}-{i:032x}" for i in range(slurm_settings.max_compute_services)]
+    mgr.client.get_instruction.return_value = (
+        ComputeManagerInstruction.OK,
+        {"compute_service_ids": ids, "num_tasks": 10},
+    )
+
+    with patch.object(mgr, "maintain_compute_services") as maintain, patch.object(
+        mgr, "create_compute_services"
+    ) as create:
+        assert mgr.cycle() is True
+
+    maintain.assert_called_once()
+    create.assert_not_called()
+
+
+def test_cycle_runs_maintenance_before_scale_up(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """On a scale-up cycle, maintenance runs once, before submission."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    mgr.client.get_instruction.return_value = (
+        ComputeManagerInstruction.OK,
+        {"compute_service_ids": [], "num_tasks": 1},
+    )
+
+    calls = []
+    with patch.object(
+        mgr,
+        "maintain_compute_services",
+        side_effect=lambda data: calls.append("maintain"),
+    ), patch.object(
+        mgr,
+        "create_compute_services",
+        side_effect=lambda data, target: calls.append("create") or 0,
+    ):
+        assert mgr.cycle() is True
+
+    assert calls == ["maintain", "create"]
+
+
+def test_cycle_scale_up_runs_each_primitive_once(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """End-to-end scale-up cycle with the real ``create_compute_services``:
+    each maintenance primitive runs exactly once, then the job is submitted."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    mgr.client.get_instruction.return_value = (
+        ComputeManagerInstruction.OK,
+        {"compute_service_ids": [], "num_tasks": 1},
+    )
+
+    with patch.object(mgr.batch_api, "check_job_health") as health, patch.object(
+        mgr.batch_api, "verify_running_jobs"
+    ) as verify, patch.object(
+        mgr.batch_api, "clear_successful_jobs"
+    ) as clear, patch.object(
+        mgr.batch_api, "jobs_pending", return_value=False
+    ), patch.object(
+        mgr.batch_api, "submit_job", return_value="1"
+    ) as submit:
+        assert mgr.cycle() is True
+
+    health.assert_called_once_with()
+    verify.assert_called_once_with(set())
+    clear.assert_called_once_with()
+    submit.assert_called_once()
+
+
+class _FakeClient:
+    """Plain (non-mock) client, to observe how ``cycle`` patches it."""
+
+    api_url = "http://example.com"
+
+    def get_instruction(self, scopes, protocols, compute_manager_id):
+        return ComputeManagerInstruction.OK, {
+            "compute_service_ids": [],
+            "num_tasks": 0,
+        }
+
+    def update_status(self, compute_manager_id, status, detail=None, saturation=None):
+        pass
+
+
+def test_cycle_restores_client_get_instruction(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """``cycle`` leaves no ``get_instruction`` instance attribute behind, so
+    later cycles resolve the method afresh from the client class."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    client = _FakeClient()
+    mgr.client = client
+
+    with patch.object(mgr, "maintain_compute_services") as maintain:
+        assert mgr.cycle() is True
+        assert "get_instruction" not in vars(client)
+        assert mgr.cycle() is True
+        assert "get_instruction" not in vars(client)
+
+    assert maintain.call_count == 2
+
+
+def test_cycle_runs_maintenance_on_skip(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """SKIP still carries ``compute_service_ids``; housekeeping still runs."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    data = {"compute_service_ids": []}
+    mgr.client.get_instruction.return_value = (ComputeManagerInstruction.SKIP, data)
+
+    with patch.object(mgr, "maintain_compute_services") as maintain, patch.object(
+        mgr, "create_compute_services"
+    ) as create:
+        assert mgr.cycle() is True
+
+    maintain.assert_called_once_with(data)
+    create.assert_not_called()
+
+
+def test_cycle_skips_maintenance_on_shutdown(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    mgr = _build_manager(slurm_settings, tmp_path)
+    mgr.client.get_instruction.return_value = (
+        ComputeManagerInstruction.SHUTDOWN,
+        {"message": "bye"},
+    )
+
+    with patch.object(mgr, "maintain_compute_services") as maintain:
+        assert mgr.cycle() is False
+
+    maintain.assert_not_called()
+    mgr.client.update_status.assert_not_called()
+
+
+def test_cycle_propagates_maintenance_errors(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """A failing health check aborts the cycle before sizing or submission,
+    and the client's ``get_instruction`` is restored afterwards."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    get_instruction = mgr.client.get_instruction
+    get_instruction.return_value = (
+        ComputeManagerInstruction.OK,
+        {"compute_service_ids": [], "num_tasks": 1},
+    )
+
+    with patch.object(
+        mgr.batch_api, "check_job_health", side_effect=JobFailureError("boom")
+    ), patch.object(mgr, "create_compute_services") as create:
+        with pytest.raises(JobFailureError, match="boom"):
+            mgr.cycle()
+
+    create.assert_not_called()
+    mgr.client.update_status.assert_not_called()
+    assert mgr.client.get_instruction is get_instruction
 
 
 def test_generate_job_name_format(slurm_settings: SlurmManagerSettings, tmp_path: Path):
