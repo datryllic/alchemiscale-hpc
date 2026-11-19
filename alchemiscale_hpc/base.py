@@ -25,6 +25,7 @@ import re
 import tempfile
 import warnings
 from abc import ABC, abstractmethod
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar, Dict, FrozenSet, List, Optional, Set
@@ -194,7 +195,7 @@ class HPCManagerSettings(ComputeManagerSettings):
         manager that submitted them. alchemiscale rejects a second manager
         registering under a name that is already registered with the same
         server, but managers pointed at different servers can share a name;
-        operators should keep names unique per cluster account.
+        managers under the same cluster user should have different names.
 
         Existing configs that still set ``job_name_prefix`` continue to load;
         the value is ignored and a :class:`FutureWarning` (shown by default,
@@ -314,18 +315,22 @@ class HPCBatchApi(ABC):
     * :meth:`jobs_pending` --- gate that lets the cycle skip submitting
       while prior submissions are still queueing
     * :meth:`submit_job` --- the actual submission
+    * :meth:`recover_jobs` --- rebuild ``tracked_jobs`` from the batch
+      system; called once at startup (and by ``show-jobs --mine``)
 
     **Operator/diagnostic primitives** (only invoked by the
     ``alchemiscale-hpc <backend> ...`` CLI; the autoscaling loop never
     calls these):
 
     * :meth:`get_jobs` --- backs ``show-jobs``
-    * :meth:`clear_failed_jobs` --- backs ``cleanup --failed``
 
     The split reflects intent, not optionality. The CLI is part of the
     operator interface for any production deployment, so a backend that
-    leaves ``get_jobs`` or ``clear_failed_jobs`` as no-ops is shipping a
-    half-finished operator experience.
+    leaves ``get_jobs`` as a no-op is shipping a half-finished operator
+    experience.
+
+    :meth:`clear_failed_jobs` untracks failed jobs; the manager loop does
+    not call it yet (see #7).
     """
 
     def __init__(self, settings: HPCManagerSettings):
@@ -348,10 +353,14 @@ class HPCBatchApi(ABC):
     # mutating ``tracked_jobs`` directly so submission timestamps stay in sync)
     # ------------------------------------------------------------------
 
-    def _track(self, job_id: str) -> None:
-        """Record a newly-submitted job and stamp it with the current time."""
+    def _track(self, job_id: str, submitted: Optional[datetime] = None) -> None:
+        """Record a job and its submission time.
+
+        ``submitted`` defaults to now, as for a job just submitted. Jobs
+        recovered from the batch system pass their recorded submission time.
+        """
         self.tracked_jobs.add(job_id)
-        self._submission_times[job_id] = datetime.now(tz=timezone.utc)
+        self._submission_times[job_id] = submitted or datetime.now(tz=timezone.utc)
 
     def _untrack(self, job_id: str) -> None:
         """Forget a job (e.g. once it has completed or failed)."""
@@ -412,6 +421,35 @@ class HPCBatchApi(ABC):
     def submit_job(self, script_path: Path) -> str:
         """Submit ``script_path`` to the batch system and return the job ID."""
 
+    @abstractmethod
+    def recover_jobs(self, include_finished: bool = False) -> List[Dict[str, str]]:
+        """Track this manager's jobs found in the batch system.
+
+        ``tracked_jobs`` is held in memory, so it is empty after a restart
+        and in each operator CLI invocation. This rebuilds it from the batch
+        system: every job of the current user whose name satisfies
+        :func:`is_own_job_name` for ``settings.name`` is tracked, with its
+        recorded submission time so that
+        ``job_registration_grace_period`` still applies. This relies on
+        managers under the same cluster user having different names.
+
+        Called once by :meth:`HPCManager.start` before the first cycle, and by
+        the ``show-jobs --mine`` CLI command.
+
+        Parameters
+        ----------
+        include_finished
+            If False, recover only jobs still in the queue (pending, running,
+            ...). If True, also recover recently finished (completed or
+            failed) jobs; the lookback window is backend-defined.
+
+        Returns
+        -------
+        list of dict
+            The recovered jobs, each with at minimum ``job_id``, ``name``,
+            ``state``.
+        """
+
     # ------------------------------------------------------------------
     # Operator/diagnostic primitives
     # ------------------------------------------------------------------
@@ -431,12 +469,10 @@ class HPCBatchApi(ABC):
 
     @abstractmethod
     def clear_failed_jobs(self) -> None:
-        """Operator-driven cleanup hook for failed jobs. Backs
-        ``alchemiscale-hpc <backend> cleanup --failed``.
+        """Untrack failed jobs.
 
-        Mirrors :meth:`clear_successful_jobs` but for failed jobs. Not called
-        on every cycle; only reached after an operator has investigated a
-        failure and asked to clear the wreckage.
+        Mirrors :meth:`clear_successful_jobs` but for failed jobs. The
+        manager loop does not call it yet (see #7).
         """
 
 
@@ -484,6 +520,32 @@ class HPCManager(ComputeManager, ABC):
     @abstractmethod
     def _create_batch_api(self) -> HPCBatchApi:
         """Construct and return the backend-specific :class:`HPCBatchApi`."""
+
+    def start(self, max_cycles: int | None = None, steal=False):
+        """Recover this manager's queued jobs, then run the main loop.
+
+        Without recovery, jobs submitted before a restart would be invisible
+        to the cycle: pending jobs would not stop it from submitting more,
+        and running jobs would not be checked for registration. Finished
+        jobs are not recovered; see :meth:`HPCBatchApi.recover_jobs`.
+
+        A running job that is not registered with the server is recovered
+        with its original submission time, so a restart does not clear a
+        :class:`JobNotFoundError` halt; the first cycle raises again until
+        the job ends or is cancelled.
+        """
+        try:
+            recovered = self.batch_api.recover_jobs()
+        except Exception as e:
+            self.logger.error(f"Failed to recover jobs from the batch system: {e}")
+            raise
+        counts = Counter(job["state"] for job in recovered)
+        summary = ", ".join(f"{n} {state}" for state, n in sorted(counts.items()))
+        self.logger.info(
+            f"Recovered {len(recovered)} job(s) from the batch system"
+            + (f" ({summary})" if summary else "")
+        )
+        super().start(max_cycles=max_cycles, steal=steal)
 
     def cycle(self) -> bool:
         """Run one manager cycle, with backend maintenance on every ``OK``/``SKIP``.

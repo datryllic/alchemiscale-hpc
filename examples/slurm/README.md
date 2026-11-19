@@ -96,6 +96,9 @@ View SLURM jobs:
 alchemiscale-hpc slurm show-jobs -c my-manager-config.yml
 ```
 
+Add `--mine` to show only the jobs submitted by the manager named in the
+config (job names `<name>.<uuid_hex>`).
+
 Or use standard SLURM commands:
 
 ```bash
@@ -121,26 +124,33 @@ alchemiscale-hpc slurm clear-error \
     -s my-service-config.yml
 ```
 
-### Cleanup Jobs
+### Show the Manager's Jobs
 
-Clear failed jobs from the manager's in-memory tracking set:
-
-```bash
-alchemiscale-hpc slurm cleanup -c my-manager-config.yml --failed
-```
-
-Clear successful jobs from tracking:
+List the manager's queued and running jobs:
 
 ```bash
-alchemiscale-hpc slurm cleanup -c my-manager-config.yml --successful
+alchemiscale-hpc slurm show-jobs -c my-manager-config.yml --mine
 ```
 
-Note: for SLURM, `cleanup` only updates the manager's in-memory tracking. It
-does not purge SLURM accounting (`sacct`) records or delete job scripts. (The
-same `cleanup` command on a Kubernetes-style backend would actually delete
-the corresponding Job objects.) To prevent job scripts from being removed
-automatically after submission (useful for debugging), set
-`keep_job_scripts: true` in the manager config.
+Add `--finished` to also list the jobs that finished in the last 7 days, with
+their final state, from `sacct`:
+
+```bash
+alchemiscale-hpc slurm show-jobs -c my-manager-config.yml --mine --finished
+```
+
+The manager's jobs are found by name, with the same queries the manager uses
+when it starts. SLURM keeps finished jobs only as accounting records, so there
+is nothing to clean up. To keep job scripts after submission (useful for
+debugging), set `keep_job_scripts: true` in the manager config.
+
+### Restarting After an Error
+
+On startup, the manager recovers its jobs that are still in the SLURM queue,
+with their original submission times. Restarting therefore does not clear a
+halt caused by a running job that never registered with the server
+(`JobNotFoundError`): the first cycle finds the same job and halts again,
+until the job ends or you cancel it with `scancel`.
 
 ## How It Works
 
@@ -197,7 +207,10 @@ automatically after submission (useful for debugging), set
    - Service registers with API
    - Claims and executes tasks
    - Deregisters when done (max tasks/time reached or no more tasks)
-6. **Manager tracks** job IDs and cleans up completed/failed jobs
+6. **Manager tracks** job IDs and cleans up completed/failed jobs. On
+   startup, it recovers its queued jobs from `squeue` by job name, so a
+   restarted manager does not submit on top of jobs that are still pending.
+   This is why managers under the same cluster user need different names.
 
 ### Job Lifecycle
 

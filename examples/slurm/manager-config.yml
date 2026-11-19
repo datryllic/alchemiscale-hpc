@@ -63,8 +63,7 @@ job_registration_grace_period: 120
 # Run the per-cycle clear_successful_jobs step (default: true).
 cleanup_successful_jobs: true
 
-# Run clear_failed_jobs when `alchemiscale-hpc slurm cleanup --failed` is
-# invoked (default: true).
+# Let clear_failed_jobs untrack failed jobs (default: true).
 cleanup_failed_jobs: true
 
 # Job script handling
