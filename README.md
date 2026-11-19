@@ -73,8 +73,8 @@ alchemiscale-hpc slurm clear-error -c manager-config.yml -s service-config.yml
 # Show SLURM jobs
 alchemiscale-hpc slurm show-jobs -c manager-config.yml
 
-# Report the manager's recently failed (with reasons) and completed jobs
-alchemiscale-hpc slurm cleanup -c manager-config.yml --failed --completed
+# Show this manager's jobs, including recently finished ones
+alchemiscale-hpc slurm show-jobs -c manager-config.yml --mine --finished
 ```
 
 ### LSF (Coming Soon)
@@ -115,7 +115,9 @@ The package uses a modular architecture with two abstraction layers:
 
 1. **Bare base interfaces** (`base.py`): Enforced via `abc.ABC`.
    - `HPCManager`: minimal manager contract (`_create_batch_api`,
-     `create_compute_services`). Extends alchemiscale's `ComputeManager`.
+     `create_compute_services`). Extends alchemiscale's `ComputeManager`,
+     running backend housekeeping (`maintain_compute_services`: health
+     checks, server reconciliation, clearing finished jobs) every cycle.
    - `HPCBatchApi`: abstract interface for batch system commands
      (`submit_job`, `get_jobs`, `find_unregistered_jobs`,
      `clear_successful_jobs`, `clear_failed_jobs`, ...). `recover_jobs`
@@ -127,13 +129,15 @@ The package uses a modular architecture with two abstraction layers:
    - `HPCManagerSettings`: settings every backend needs (`name`,
      `max_submit_per_cycle`, ...). Job names are built as
      `<name>.<uuid_hex>`, so `name` is validated against alchemiscale's
-     compute ID rules, and should be unique per cluster account across
+     compute ID rules. A manager recognizes its jobs by name, so managers
+     under the same cluster user need different names, even across
      alchemiscale servers.
 
 2. **Script-template convenience layer** (`base.py`): the workflow shared
    by SLURM/LSF/PBS.
    - `ScriptTemplateHPCManager(HPCManager)`: implements
-     `create_compute_services` as "render template → submit → cleanup".
+     `create_compute_services` as "render template → submit → cleanup",
+     gated only on no jobs pending.
      Subclasses only implement `_create_batch_api` and `_create_job_script`.
    - `ScriptTemplateHPCManagerSettings(HPCManagerSettings)`: adds
      `job_script_template`, `job_script_dir`, `keep_job_scripts`,

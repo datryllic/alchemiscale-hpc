@@ -9,7 +9,8 @@ Two abstraction layers are provided:
 * :class:`HPCManager` --- the bare-minimum manager contract. Subclasses must
   implement :meth:`HPCManager.create_compute_services` (inherited as abstract
   from :class:`alchemiscale.compute.manager.ComputeManager`) and
-  :meth:`HPCManager._create_batch_api`.
+  :meth:`HPCManager._create_batch_api`. It also runs per-cycle backend
+  housekeeping via :meth:`HPCManager.maintain_compute_services`.
 * :class:`ScriptTemplateHPCManager` --- a concrete subclass that implements
   the common "render a job script from a template, then submit it" workflow
   used by all current backends (SLURM, LSF, PBS). Subclasses only need to
@@ -27,7 +28,8 @@ from abc import ABC, abstractmethod
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import ClassVar, Dict, FrozenSet, List, Optional, Set, Tuple
+from unittest.mock import patch
 from uuid import uuid4
 
 import yaml
@@ -35,6 +37,23 @@ from pydantic import Field, PrivateAttr, field_validator, model_validator
 
 from alchemiscale.compute.manager import ComputeManager
 from alchemiscale.compute.settings import ComputeManagerSettings, ComputeServiceSettings
+from alchemiscale.storage.models import (
+    ComputeManagerID,
+    ComputeManagerInstruction,
+    ComputeServiceID,
+)
+
+# Matches any ``{{ ... }}`` token, whatever its spacing (including newlines), so
+# that near-misses like ``{{JOB_NAME}}`` are reported along with unknown names.
+# Extra surrounding braces are not flagged: ``{{{ JOB_NAME }}}`` passes
+# validation but renders as ``{<job name>}``.
+_TEMPLATE_TOKEN = re.compile(r"\{\{[^{}]*\}\}")
+
+
+def _placeholder(key: str) -> str:
+    """Return the exact ``{{ KEY }}`` form that the manager substitutes."""
+    return f"{{{{ {key} }}}}"
+
 
 # Registry of available backends, populated by backend modules at import time.
 # Maps backend name (e.g. "slurm") -> (Manager class, Settings class, BatchApi class).
@@ -81,13 +100,6 @@ def get_backend(name: str) -> tuple:
 def list_backends() -> List[str]:
     """Return the names of all registered backends."""
     return sorted(_BACKENDS)
-
-
-# alchemiscale's ``ComputeIDBase`` name rule (``^[a-zA-Z][a-zA-Z0-9_.:]*$``).
-# It applies to the ``ComputeManagerID`` derived from the manager's ``name``,
-# and to the ``ComputeServiceID`` each job registers under its job name
-# ``{name}.{uuid_hex}``; a name satisfying it yields valid job names too.
-_MANAGER_NAME_PATTERN = re.compile(r"[a-zA-Z][a-zA-Z0-9_.:]*")
 
 
 def make_job_name(manager_name: str) -> str:
@@ -188,8 +200,16 @@ class HPCManagerSettings(ComputeManagerSettings):
         ``ComputeServiceID`` derived from the job name must satisfy
         alchemiscale's ID rules, which forbid '-' and require a leading
         letter.
+
+        The rules are checked by building both IDs, so they stay upstream's.
+        alchemiscale only checks them when the manager is constructed;
+        OpenFreeEnergy/alchemiscale#539 proposes checking them in its settings
+        models, after which this validator only needs to explain job naming.
         """
-        if not _MANAGER_NAME_PATTERN.fullmatch(value):
+        try:
+            ComputeManagerID.new_from_name(value)
+            ComputeServiceID.new_from_name(make_job_name(value))
+        except ValueError as e:
             raise ValueError(
                 f"name {value!r} is not valid for an HPC compute manager. "
                 "It must start with a letter and contain only letters, digits, "
@@ -199,7 +219,7 @@ class HPCManagerSettings(ComputeManagerSettings):
                 "under its job name; alchemiscale compute IDs forbid '-' and "
                 "require a leading letter, so any other name produces compute "
                 "services that cannot register."
-            )
+            ) from e
         return value
 
     @model_validator(mode="wrap")
@@ -212,7 +232,7 @@ class HPCManagerSettings(ComputeManagerSettings):
         manager that submitted them. alchemiscale rejects a second manager
         registering under a name that is already registered with the same
         server, but managers pointed at different servers can share a name;
-        operators should keep names unique per cluster account.
+        managers under the same cluster user should have different names.
 
         Existing configs that still set ``job_name_prefix`` continue to load;
         the value is ignored and a :class:`FutureWarning` (shown by default,
@@ -329,9 +349,10 @@ class HPCBatchApi(ABC):
     production-quality backend, but useful to know which is which when
     implementing or maintaining a new system:
 
-    **Manager-loop primitives** (called every cycle by
-    :meth:`ScriptTemplateHPCManager.create_compute_services`; correctness
-    of autoscaling depends on these):
+    **Manager-loop primitives** (called by
+    :meth:`HPCManager.maintain_compute_services` every ``OK``/``SKIP``
+    cycle, or by :meth:`ScriptTemplateHPCManager.create_compute_services`
+    on scale-up cycles; correctness of autoscaling depends on these):
 
     * :meth:`clear_failed_jobs` --- untrack failed jobs and report why
       they failed
@@ -344,7 +365,7 @@ class HPCBatchApi(ABC):
       while prior submissions are still queueing
     * :meth:`submit_job` --- the actual submission
     * :meth:`recover_jobs` --- rebuild ``tracked_jobs`` from the batch
-      system; called once at startup (and by ``cleanup``)
+      system; called once at startup (and by ``show-jobs --mine``)
 
     **Operator/diagnostic primitives** (only invoked by the
     ``alchemiscale-hpc <backend> ...`` CLI; the autoscaling loop never
@@ -403,7 +424,8 @@ class HPCBatchApi(ABC):
     # ------------------------------------------------------------------
     # Manager-loop primitives
     # ------------------------------------------------------------------
-    # Called every cycle by ScriptTemplateHPCManager.create_compute_services.
+    # Called by HPCManager.maintain_compute_services (every OK/SKIP cycle)
+    # and ScriptTemplateHPCManager.create_compute_services (scale-up cycles).
     # Correctness of autoscaling depends on these.
 
     @abstractmethod
@@ -414,9 +436,8 @@ class HPCBatchApi(ABC):
         not report it again. Called every cycle by
         :meth:`HPCManager.handle_finished_jobs`, which logs the reasons and
         decides whether to stop, and once at startup for jobs recovered by
-        :meth:`recover_jobs`. Also backs ``cleanup --failed``. For
-        Kubernetes-style backends, clearing would also delete the job from
-        the batch system.
+        :meth:`recover_jobs`. For Kubernetes-style backends, clearing would
+        also delete the job from the batch system.
         """
 
     @abstractmethod
@@ -450,7 +471,8 @@ class HPCBatchApi(ABC):
         an in-memory operation (drop the IDs from ``tracked_jobs``); for
         Kubernetes-style backends this should actually delete the Job
         objects from the batch system. Either way, this is called
-        unconditionally by :meth:`HPCManager.handle_finished_jobs` once per
+        unconditionally by :meth:`HPCManager.handle_finished_jobs`, from
+        :meth:`HPCManager.maintain_compute_services` once per ``OK``/``SKIP``
         cycle, gated only by the ``cleanup_successful_jobs`` setting. A
         cleared job counts as a sign of health there.
         """
@@ -473,10 +495,10 @@ class HPCBatchApi(ABC):
         :func:`is_own_job_name` for ``settings.name`` is tracked, with its
         recorded submission time so that
         ``job_registration_grace_period`` still applies. This relies on
-        manager names being unique per cluster account.
+        managers under the same cluster user having different names.
 
-        Called once by :meth:`HPCManager.start` before the first cycle, and by
-        the ``cleanup`` CLI command, both with ``include_finished=True``.
+        Called by :meth:`HPCManager.start` before the first cycle, and by the
+        ``show-jobs --mine`` CLI command.
 
         Parameters
         ----------
@@ -515,7 +537,9 @@ class HPCManager(ComputeManager, ABC):
 
     Subclasses must implement :meth:`_create_batch_api` and
     :meth:`create_compute_services` (inherited from
-    :class:`alchemiscale.compute.manager.ComputeManager`).
+    :class:`alchemiscale.compute.manager.ComputeManager`). Backend
+    housekeeping runs every ``OK``/``SKIP`` cycle via
+    :meth:`maintain_compute_services`, which subclasses may extend.
 
     For backends that follow the standard "render script template, submit
     via batch system" pattern, prefer subclassing
@@ -700,29 +724,107 @@ class HPCManager(ComputeManager, ABC):
                 "registered with the server; checking again next cycle"
             )
 
+    def cycle(self) -> bool:
+        """Run one manager cycle, with backend maintenance on every ``OK``/``SKIP``.
+
+        The upstream :meth:`ComputeManager.cycle` only calls
+        :meth:`create_compute_services` when scaling up, and has no hook for
+        per-cycle housekeeping. Rather than duplicate its body here, we wrap
+        ``client.get_instruction`` for the duration of the cycle so that
+        :meth:`maintain_compute_services` runs on the instruction data as soon
+        as it arrives, before any sizing or submission. ``SHUTDOWN`` skips
+        maintenance. Exceptions raised by maintenance propagate out of
+        ``cycle`` exactly as they would from :meth:`create_compute_services`.
+        """
+        client = self.client
+        get_instruction = client.get_instruction
+
+        def _get_instruction_and_maintain(*args, **kwargs):
+            instruction, data = get_instruction(*args, **kwargs)
+            if instruction in (
+                ComputeManagerInstruction.OK,
+                ComputeManagerInstruction.SKIP,
+            ):
+                self.maintain_compute_services(data)
+            return instruction, data
+
+        # ``patch.object`` restores the client exactly on exit: it removes the
+        # shadowing instance attribute rather than pinning the bound method.
+        with patch.object(client, "get_instruction", _get_instruction_and_maintain):
+            return super().cycle()
+
+    def maintain_compute_services(self, data: dict) -> None:
+        """Per-cycle backend housekeeping, independent of scale-up.
+
+        Called on every ``OK`` and ``SKIP`` instruction, before the upstream
+        sizing decision and any call to :meth:`create_compute_services`.
+        Upstream ``ComputeManager`` has no such hook;
+        OpenFreeEnergy/alchemiscale#538 moves this work into its cycle, which
+        will let us drop the :meth:`cycle` override (#17).
+
+        Steps:
+
+        1. Clear successful jobs, and log and untrack failed jobs
+           (:meth:`handle_finished_jobs`).
+        2. Check running jobs are registered with the server
+           (:meth:`handle_unregistered_jobs`).
+
+        Parameters
+        ----------
+        data
+            Data from the server instruction. Both ``OK`` and ``SKIP``
+            instructions carry ``compute_service_ids``, the list of services
+            the server currently associates with this manager.
+        """
+        server_job_names = self._server_job_names(data)
+
+        self.logger.info("Clearing finished batch jobs")
+        self.handle_finished_jobs(server_job_names)
+
+        self.logger.info("Verifying running jobs are registered with server")
+        self.handle_unregistered_jobs(server_job_names)
+
+    @staticmethod
+    def _server_job_names(data: dict) -> Set[str]:
+        """Return the job names of the services the server lists in ``data``."""
+        # Each ComputeServiceID has form "{name}-{uuid_hex}", where `name`
+        # cannot itself contain '-'. Strip the trailing hex suffix.
+        return {csid.rsplit("-", 1)[0] for csid in data["compute_service_ids"]}
+
 
 class ScriptTemplateHPCManager(HPCManager):
     """HPC manager that submits jobs by rendering a job-script template.
 
     Implements the common ``create_compute_services`` workflow shared by the
-    SLURM/LSF/PBS backends:
-
-    1. Clear successful jobs, and log and untrack failed jobs
-       (:meth:`HPCManager.handle_finished_jobs`).
-    2. Check running jobs are registered with the server
-       (:meth:`HPCManager.handle_unregistered_jobs`).
-    3. If no jobs are pending, submit up to ``target`` new services. The
-       sizing decision (how many to actually submit) is made upstream in
-       :meth:`alchemiscale.compute.manager.ComputeManager._compute_jobs_to_create`
-       and passed to us as ``target``. If every submission fails in more
-       than ``max_consecutive_failed_cycles`` cycles while no service of
-       this manager is registered, :class:`JobSubmissionError` is raised.
+    SLURM/LSF/PBS backends: if no jobs are pending, submit up to ``target``
+    new services. The sizing decision (how many to actually submit) is made
+    upstream in
+    :meth:`alchemiscale.compute.manager.ComputeManager._compute_jobs_to_create`
+    and passed to us as ``target``. If every submission fails in more than
+    ``max_consecutive_failed_cycles`` cycles while no service of this manager
+    is registered, :class:`JobSubmissionError` is raised. Per-cycle
+    housekeeping happens separately in
+    :meth:`HPCManager.maintain_compute_services`.
 
     Subclasses only need to implement :meth:`_create_job_script`, which renders
-    the template into a script ready for ``submit_job``.
+    the template into a script ready for ``submit_job``, and extend
+    :attr:`TEMPLATE_PLACEHOLDERS` with any backend-specific placeholders.
     """
 
     settings: ScriptTemplateHPCManagerSettings
+
+    #: Placeholders every job script template must contain. Without them, jobs
+    #: run but their compute services never register with the server under
+    #: the expected name.
+    REQUIRED_TEMPLATE_PLACEHOLDERS: ClassVar[FrozenSet[str]] = frozenset(
+        {"JOB_NAME", "COMPUTE_MANAGER_ID"}
+    )
+
+    #: Every placeholder the backend substitutes. Used both to validate the
+    #: template at construction and to check the keys passed to
+    #: :meth:`_render_template`, so a mismatch between them is caught on the
+    #: first render (and in tests).
+    TEMPLATE_PLACEHOLDERS: ClassVar[FrozenSet[str]] = REQUIRED_TEMPLATE_PLACEHOLDERS
 
     def __init__(
         self,
@@ -733,14 +835,17 @@ class ScriptTemplateHPCManager(HPCManager):
 
         with open(self.settings.job_script_template, "r") as f:
             self.job_script_template: str = f.read()
+        # fail fast on a bad template, rather than on the first submission
+        self._validate_template()
 
     def create_compute_services(self, data: dict, target: int) -> int:
         """Create up to ``target`` compute services by submitting batch jobs.
 
         Called by the parent :class:`ComputeManager` when scaling up is
         warranted. The cycle has already decided how many services to aim
-        for via :meth:`ComputeManager._compute_jobs_to_create`; this method
-        just runs the backend-specific health checks and submits scripts.
+        for via :meth:`ComputeManager._compute_jobs_to_create`, and
+        :meth:`maintain_compute_services` has already run; this method just
+        submits scripts.
 
         If any submitted jobs are still pending in the batch system, this
         method short-circuits to 0 — letting the cluster work through what
@@ -763,17 +868,7 @@ class ScriptTemplateHPCManager(HPCManager):
         int
             Number of new compute services actually created (``<= target``).
         """
-        compute_service_ids = data["compute_service_ids"]
-
-        # Each ComputeServiceID has form "{name}-{uuid_hex}", where `name`
-        # cannot itself contain '-'. Strip the trailing hex suffix.
-        server_job_names = {csid.rsplit("-", 1)[0] for csid in compute_service_ids}
-
-        self.logger.info("Clearing finished batch jobs")
-        self.handle_finished_jobs(server_job_names)
-
-        self.logger.info("Verifying running jobs are registered with server")
-        self.handle_unregistered_jobs(server_job_names)
+        server_job_names = self._server_job_names(data)
 
         if self.batch_api.jobs_pending():
             self.logger.info("Skipping job creation, pending jobs exist")
@@ -849,11 +944,57 @@ class ScriptTemplateHPCManager(HPCManager):
         """
         return make_job_name(self.settings.name)
 
+    def _validate_template(self) -> None:
+        """Check the loaded template against the declared placeholders.
+
+        Any other ``{{ ... }}`` token would be left in the rendered script
+        unchanged, so it is logged as a warning.
+
+        Raises
+        ------
+        ValueError
+            If any of :attr:`REQUIRED_TEMPLATE_PLACEHOLDERS` is missing.
+        """
+        template = self.job_script_template
+        path = self.settings.job_script_template
+
+        missing = sorted(
+            _placeholder(key)
+            for key in self.REQUIRED_TEMPLATE_PLACEHOLDERS
+            if _placeholder(key) not in template
+        )
+        if missing:
+            raise ValueError(
+                f"Job script template {path} is missing required placeholder(s) "
+                f"{', '.join(missing)}; jobs would not register with the server. "
+                "Pass them to `alchemiscale compute synchronous "
+                '--name "{{ JOB_NAME }}" '
+                '--compute-manager-id "{{ COMPUTE_MANAGER_ID }}"`.'
+            )
+
+        known = sorted(_placeholder(key) for key in self.TEMPLATE_PLACEHOLDERS)
+        unknown = sorted(set(_TEMPLATE_TOKEN.findall(template)) - set(known))
+        for token in unknown:
+            self.logger.warning(
+                f"Job script template {path}: {token} is not a known placeholder "
+                f"and will be left unchanged. Known placeholders: {', '.join(known)}"
+            )
+
     def _render_template(self, substitutions: Dict[str, str]) -> str:
-        """Substitute ``{{ KEY }}`` placeholders in the loaded template."""
+        """Substitute ``{{ KEY }}`` placeholders in the loaded template.
+
+        ``substitutions`` must have exactly the keys in
+        :attr:`TEMPLATE_PLACEHOLDERS`.
+        """
+        if set(substitutions) != self.TEMPLATE_PLACEHOLDERS:
+            raise ValueError(
+                f"Substitution keys {sorted(substitutions)} do not match "
+                f"{type(self).__name__}.TEMPLATE_PLACEHOLDERS "
+                f"{sorted(self.TEMPLATE_PLACEHOLDERS)}"
+            )
         rendered = self.job_script_template
         for key, value in substitutions.items():
-            rendered = rendered.replace(f"{{{{ {key} }}}}", value)
+            rendered = rendered.replace(_placeholder(key), value)
         return rendered
 
     def _write_job_script(self, content: str, job_name: str) -> Path:

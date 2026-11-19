@@ -35,14 +35,14 @@ cp examples/slurm/service-config.yml my-service-config.yml
 - Update `SERVICE_CONFIG` path to point to your service config file
 
 **Edit `my-manager-config.yml`:**
-- Set `name` to a unique identifier for this manager. SLURM job names are
-  built as `<name>.<uuid_hex>`, so `name` must start with a letter and contain
-  only letters, digits, `_`, `.`, and `:` (no `-`). Keep it unique across all
-  managers on the cluster account, including ones pointed at other
-  alchemiscale servers; the server only rejects duplicates among managers
-  registered with it
+- Set `name` for this manager. SLURM job names are built as
+  `<name>.<uuid_hex>`, so `name` must start with a letter and contain only
+  letters, digits, `_`, `.`, and `:` (no `-`). The manager recognizes its jobs
+  by name, so managers running under the same cluster user need different
+  names, even if they use different alchemiscale servers. Managers under
+  different users can share a name
 - Set `job_script_template` to the path of your job template
-- Configure `partition`, `account`, `qos` for your SLURM system
+- Configure `partition`, `account`, `qos` for your SLURM system; the manager passes them to `sbatch` on the command line, overriding matching `#SBATCH` directives in the template
 - Set `max_compute_services` based on your resource allocation
 - Adjust `sleep_interval` and `max_submit_per_cycle` for your scaling needs
 - Set `logfile` path
@@ -169,26 +169,25 @@ compute service deregisters. The manager stops with `JobNotFoundError` only
 if the job is still unregistered on a later check at least
 `job_registration_grace_period` seconds after it was first found.
 
-To list the manager's recently failed jobs, with their reasons:
+### Show the Manager's Jobs
+
+List the manager's queued and running jobs:
 
 ```bash
-alchemiscale-hpc slurm cleanup -c my-manager-config.yml --failed
+alchemiscale-hpc slurm show-jobs -c my-manager-config.yml --mine
 ```
 
-To list its recently successful jobs:
+Add `--finished` to also list the jobs that finished in the last 7 days, with
+their final state, from `sacct`:
 
 ```bash
-alchemiscale-hpc slurm cleanup -c my-manager-config.yml --successful
+alchemiscale-hpc slurm show-jobs -c my-manager-config.yml --mine --finished
 ```
 
-`cleanup` finds the manager's jobs by name in `squeue` and, for jobs that
-finished in the last 7 days, in `sacct`, and reports the failed or successful
-ones. It only reads SLURM: accounting (`sacct`) records, job scripts, and a
-running manager are unaffected. `--successful` reports nothing if
-`cleanup_successful_jobs` is false; `cleanup_failed_jobs` is ignored, so
-`--failed` always reports. To prevent job scripts from being removed
-automatically after submission (useful for debugging), set
-`keep_job_scripts: true` in the manager config.
+The manager's jobs are found by name, with the same queries the manager uses
+when it starts. SLURM keeps finished jobs only as accounting records, so there
+is nothing to clean up. To keep job scripts after submission (useful for
+debugging), set `keep_job_scripts: true` in the manager config.
 
 ### Restarting After an Error
 
@@ -267,8 +266,8 @@ with `JobNotFoundError` again, until the job ends or you cancel it with
 6. **Manager tracks** job IDs, logs failed jobs with their reasons, and
    stops tracking completed and failed jobs. On startup, it recovers its jobs
    from `squeue` and `sacct` by job name, so a restarted manager does not
-   submit on top of jobs that are still pending. This is why `name` must be
-   unique per cluster account.
+   submit on top of jobs that are still pending. This is why managers under the
+   same cluster user need different names.
 
 ### Job Lifecycle
 

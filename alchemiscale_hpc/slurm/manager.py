@@ -6,9 +6,10 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set
+from typing import ClassVar, Dict, FrozenSet, Iterable, List, Optional, Set
 
 from ..base import (
+    _TEMPLATE_TOKEN,
     HPCBatchApi,
     ScriptTemplateHPCManager,
     is_own_job_name,
@@ -199,7 +200,7 @@ class SlurmBatchApi(HPCBatchApi):
 
     def submit_job(self, script_path: Path) -> str:
         """Submit a job script to SLURM and return the assigned job ID."""
-        cmd = [self.settings.submit_command, str(script_path)]
+        cmd = [self.settings.submit_command, *self._submit_options(), str(script_path)]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         except subprocess.CalledProcessError as e:
@@ -287,6 +288,20 @@ class SlurmBatchApi(HPCBatchApi):
     # ------------------------------------------------------------------
     # internal helpers
     # ------------------------------------------------------------------
+
+    def _submit_options(self) -> List[str]:
+        """Return ``sbatch`` options for the partition, account and QoS settings.
+
+        Unset settings are omitted, leaving SLURM's default or any directive
+        in the job script. Command-line options take precedence over
+        ``#SBATCH`` directives, so a setting overrides the template.
+        """
+        options = {
+            "partition": self.settings.partition,
+            "account": self.settings.account,
+            "qos": self.settings.qos,
+        }
+        return [f"--{key}={value}" for key, value in options.items() if value]
 
     def _squeue_tracked(self, state: str) -> List[Dict[str, str]]:
         """Return tracked jobs in ``state`` via ``squeue --jobs=``.
@@ -499,8 +514,41 @@ class SlurmManager(ScriptTemplateHPCManager):
     settings: SlurmManagerSettings
     batch_api: SlurmBatchApi
 
+    #: Placeholders that earlier templates used for the partition, account
+    #: and QoS directives. Those settings are now passed to ``sbatch`` on the
+    #: command line, so a template still using them is rejected.
+    REMOVED_TEMPLATE_PLACEHOLDERS: ClassVar[FrozenSet[str]] = frozenset(
+        {"PARTITION", "ACCOUNT", "QOS"}
+    )
+
     def _create_batch_api(self) -> SlurmBatchApi:
         return SlurmBatchApi(self.settings)
+
+    def _validate_template(self) -> None:
+        """Reject removed placeholders, then run the common checks.
+
+        Raises
+        ------
+        ValueError
+            If the template uses any of :attr:`REMOVED_TEMPLATE_PLACEHOLDERS`,
+            with any spacing.
+        """
+        removed = sorted(
+            {
+                token
+                for token in _TEMPLATE_TOKEN.findall(self.job_script_template)
+                if token[2:-2].strip() in self.REMOVED_TEMPLATE_PLACEHOLDERS
+            }
+        )
+        if removed:
+            raise ValueError(
+                f"Job script template {self.settings.job_script_template} uses "
+                f"{', '.join(removed)}, which are no longer substituted. The "
+                "`partition`, `account` and `qos` settings are now passed to "
+                "`sbatch` on the command line; delete these lines from the "
+                "template."
+            )
+        super()._validate_template()
 
     def _create_job_script(self) -> Path:
         """Render the SLURM job script template and return its path."""
@@ -508,17 +556,6 @@ class SlurmManager(ScriptTemplateHPCManager):
 
         substitutions = {
             "JOB_NAME": job_name,
-            "PARTITION": (
-                f"#SBATCH --partition={self.settings.partition}"
-                if self.settings.partition
-                else ""
-            ),
-            "ACCOUNT": (
-                f"#SBATCH --account={self.settings.account}"
-                if self.settings.account
-                else ""
-            ),
-            "QOS": (f"#SBATCH --qos={self.settings.qos}" if self.settings.qos else ""),
             "COMPUTE_MANAGER_ID": str(self.compute_manager_id),
         }
 

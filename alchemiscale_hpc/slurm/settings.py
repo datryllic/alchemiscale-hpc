@@ -15,17 +15,23 @@ class SlurmManagerSettings(ScriptTemplateHPCManagerSettings):
     partition: str | None = Field(
         None,
         description=(
-            "SLURM partition to submit jobs to. If None, uses default partition."
+            "SLURM partition to submit jobs to, passed to `sbatch` as "
+            "`--partition`. If None, uses the template's directive or the "
+            "default partition."
         ),
     )
     account: str | None = Field(
         None,
-        description=("SLURM account to charge jobs to. If None, uses default account."),
+        description=(
+            "SLURM account to charge jobs to, passed to `sbatch` as `--account`. "
+            "If None, uses the template's directive or the default account."
+        ),
     )
     qos: str | None = Field(
         None,
         description=(
-            "Quality of Service specification for jobs. If None, uses default QOS."
+            "Quality of Service for jobs, passed to `sbatch` as `--qos`. If "
+            "None, uses the template's directive or the default QOS."
         ),
     )
     submit_command: str = Field(
