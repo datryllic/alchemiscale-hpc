@@ -1,8 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name={{ JOB_NAME }}
-{{ PARTITION }}
-{{ ACCOUNT }}
-{{ QOS }}
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
@@ -13,14 +10,16 @@
 #SBATCH --error=logs/alchemiscale-%j.err
 
 # This is a template SLURM job script for alchemiscale compute services.
-# The manager will replace {{ VARIABLE }} placeholders with actual values.
+# The manager will replace the placeholders listed below with actual values.
+# It warns at startup about any other double-brace token, which would be left
+# in the script unchanged.
 #
-# Required placeholders:
+# Required placeholders (the manager refuses to start without them):
 #   {{ JOB_NAME }}            - Unique job name (auto-generated)
-#   {{ PARTITION }}           - SLURM partition directive (optional, can be empty)
-#   {{ ACCOUNT }}             - SLURM account directive (optional, can be empty)
-#   {{ QOS }}                 - SLURM QOS directive (optional, can be empty)
 #   {{ COMPUTE_MANAGER_ID }}  - Manager ID for provenance tracking
+#
+# The manager passes the `partition`, `account` and `qos` settings to sbatch on
+# the command line, where they override any matching directives here.
 #
 # Customize the resource requests above (#SBATCH directives) for your HPC system.
 

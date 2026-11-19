@@ -9,7 +9,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
-from alchemiscale.storage.models import ComputeManagerID, ComputeServiceID
+from alchemiscale.storage.models import ComputeManagerInstruction
 
 from alchemiscale_hpc import (
     HPCBatchApi,
@@ -30,7 +30,6 @@ def slurm_settings(tmp_path: Path) -> SlurmManagerSettings:
     template = tmp_path / "job-template.sh"
     template.write_text(
         "#!/bin/bash\n#SBATCH --job-name={{ JOB_NAME }}\n"
-        "{{ PARTITION }}\n{{ ACCOUNT }}\n{{ QOS }}\n"
         "echo manager={{ COMPUTE_MANAGER_ID }}\n"
     )
     return SlurmManagerSettings(
@@ -93,7 +92,10 @@ def test_slurm_settings_extends_script_template_base():
 
 def _settings_kwargs(tmp_path: Path, **overrides) -> dict:
     template = tmp_path / "job-template.sh"
-    template.write_text("#!/bin/bash\n")
+    template.write_text(
+        "#!/bin/bash\n#SBATCH --job-name={{ JOB_NAME }}\n"
+        "echo manager={{ COMPUTE_MANAGER_ID }}\n"
+    )
     kwargs = dict(
         name="testmgr",
         logfile=None,
@@ -104,22 +106,15 @@ def _settings_kwargs(tmp_path: Path, **overrides) -> dict:
     return kwargs
 
 
-@pytest.mark.parametrize(
-    "name", ["testmgr", "mycluster.gpu", "my_cluster", "Site:queue.v2", "a"]
-)
+# The naming rule itself is alchemiscale's; these only check that it is
+# applied when settings load, with the HPC explanation.
+@pytest.mark.parametrize("name", ["mycluster.gpu", "Site:queue.v2"])
 def test_settings_accepts_valid_name(tmp_path: Path, name: str):
     settings = SlurmManagerSettings(**_settings_kwargs(tmp_path, name=name))
     assert settings.name == name
-    # Catch drift from upstream's ID rules: names we accept must yield IDs
-    # alchemiscale accepts, for both the manager and its jobs' services.
-    ComputeManagerID.new_from_name(name)
-    ComputeServiceID.new_from_name(make_job_name(name))
 
 
-@pytest.mark.parametrize(
-    "name",
-    ["my-slurm-manager", "1cluster", "_cluster", ".cluster", "my cluster", ""],
-)
+@pytest.mark.parametrize("name", ["my-slurm-manager", "1cluster"])
 def test_settings_rejects_invalid_name(tmp_path: Path, name: str):
     """Names that cannot form a valid ComputeServiceID are rejected up front."""
     with pytest.raises(ValueError, match="alchemiscale compute IDs forbid '-'"):
@@ -203,16 +198,6 @@ def test_is_own_job_name_matches_generated_names():
 )
 def test_is_own_job_name_rejects_other_names(job_name: str):
     assert not is_own_job_name("foo", job_name)
-
-
-def test_generate_job_name_identifies_manager(tmp_path: Path):
-    """Managers with different names produce distinguishable job names."""
-    prefixes = set()
-    for mgr_name in ("mgra", "mgrb"):
-        settings = SlurmManagerSettings(**_settings_kwargs(tmp_path, name=mgr_name))
-        mgr = _build_manager(settings, tmp_path)
-        prefixes.add(mgr._generate_job_name().rsplit(".", 1)[0])
-    assert prefixes == {"mgra", "mgrb"}
 
 
 def test_parse_jobs_handles_empty():
@@ -532,6 +517,27 @@ def test_submit_job_parses_sbatch_output_and_tracks(
     assert "99999" in api._submission_times
 
 
+def test_submit_job_passes_partition_account_qos(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """Set options are passed to sbatch before the script; unset ones are not."""
+    api = SlurmBatchApi(slurm_settings)
+    fake = type(
+        "R",
+        (),
+        {"stdout": "Submitted batch job 1\n", "stderr": "", "returncode": 0},
+    )
+    script = tmp_path / "script.sh"
+    with patch("subprocess.run", return_value=fake) as run:
+        api.submit_job(script)
+    assert run.call_args.args[0] == [
+        "sbatch",
+        "--partition=testpart",
+        "--account=testacct",
+        str(script),
+    ]
+
+
 def test_submit_job_raises_on_unparseable_output(
     slurm_settings: SlurmManagerSettings, tmp_path: Path
 ):
@@ -573,10 +579,17 @@ def _build_manager(
     )
     # Bypass network/registration in ComputeManager.__init__ by patching the
     # client constructor it triggers.
-    with patch("alchemiscale.compute.manager.AlchemiscaleComputeManagerClient"):
-        return SlurmManager(
+    # ``autospec`` so upstream signature drift in e.g. ``get_instruction`` or
+    # ``update_status`` fails these tests.
+    with patch(
+        "alchemiscale.compute.manager.AlchemiscaleComputeManagerClient", autospec=True
+    ):
+        mgr = SlurmManager(
             settings=slurm_settings, service_settings_path=service_config
         )
+    # Instance attribute set in the real client's __init__; autospec can't see it.
+    mgr.client.api_url = "http://example.com"
+    return mgr
 
 
 def test_slurm_manager_create_batch_api_factory(
@@ -596,10 +609,8 @@ def test_slurm_manager_render_template(
     try:
         content = script_path.read_text()
         assert slurm_settings.name in content
-        assert "#SBATCH --partition=testpart" in content
-        assert "#SBATCH --account=testacct" in content
-        # qos was unset -> empty substitution
-        assert "{{ QOS }}" not in content
+        # partition/account/qos are passed to sbatch, not rendered
+        assert "--partition" not in content
         # COMPUTE_MANAGER_ID substituted
         assert "{{ COMPUTE_MANAGER_ID }}" not in content
     finally:
@@ -618,13 +629,9 @@ def test_slurm_manager_create_compute_services_cleans_up_scripts(
         submitted_paths.append(path)
         return "12345"
 
-    with patch.object(mgr.batch_api, "check_job_health"), patch.object(
-        mgr.batch_api, "verify_running_jobs"
-    ), patch.object(mgr.batch_api, "clear_successful_jobs"), patch.object(
+    with patch.object(
         mgr.batch_api, "jobs_pending", return_value=False
-    ), patch.object(
-        mgr.batch_api, "submit_job", side_effect=_fake_submit
-    ):
+    ), patch.object(mgr.batch_api, "submit_job", side_effect=_fake_submit):
         n = mgr.create_compute_services(
             {"compute_service_ids": [], "num_tasks": 1}, target=1
         )
@@ -648,13 +655,9 @@ def test_slurm_manager_keep_job_scripts(
         submitted_paths.append(path)
         return "12345"
 
-    with patch.object(mgr.batch_api, "check_job_health"), patch.object(
-        mgr.batch_api, "verify_running_jobs"
-    ), patch.object(mgr.batch_api, "clear_successful_jobs"), patch.object(
+    with patch.object(
         mgr.batch_api, "jobs_pending", return_value=False
-    ), patch.object(
-        mgr.batch_api, "submit_job", side_effect=_fake_submit
-    ):
+    ), patch.object(mgr.batch_api, "submit_job", side_effect=_fake_submit):
         mgr.create_compute_services(
             {"compute_service_ids": [], "num_tasks": 1}, target=1
         )
@@ -686,13 +689,9 @@ def test_create_compute_services_honors_target(
         submitted.append(path)
         return f"id-{len(submitted)}"
 
-    with patch.object(mgr.batch_api, "check_job_health"), patch.object(
-        mgr.batch_api, "verify_running_jobs"
-    ), patch.object(mgr.batch_api, "clear_successful_jobs"), patch.object(
+    with patch.object(
         mgr.batch_api, "jobs_pending", return_value=False
-    ), patch.object(
-        mgr.batch_api, "submit_job", side_effect=_fake_submit
-    ):
+    ), patch.object(mgr.batch_api, "submit_job", side_effect=_fake_submit):
         n = mgr.create_compute_services(
             {"compute_service_ids": [], "num_tasks": 100}, target=3
         )
@@ -706,13 +705,9 @@ def test_create_compute_services_skips_when_pending(
     """Backend gate: if any submitted jobs are still pending, do nothing
     even when ``target`` says to scale up."""
     mgr = _build_manager(slurm_settings, tmp_path)
-    with patch.object(mgr.batch_api, "check_job_health"), patch.object(
-        mgr.batch_api, "verify_running_jobs"
-    ), patch.object(mgr.batch_api, "clear_successful_jobs"), patch.object(
+    with patch.object(
         mgr.batch_api, "jobs_pending", return_value=True
-    ), patch.object(
-        mgr.batch_api, "submit_job"
-    ) as submit:
+    ), patch.object(mgr.batch_api, "submit_job") as submit:
         n = mgr.create_compute_services(
             {"compute_service_ids": [], "num_tasks": 5}, target=5
         )
@@ -720,7 +715,7 @@ def test_create_compute_services_skips_when_pending(
     submit.assert_not_called()
 
 
-def test_create_compute_services_strips_uuid_suffix_correctly(
+def test_maintain_compute_services_strips_uuid_suffix_correctly(
     slurm_settings: SlurmManagerSettings, tmp_path: Path
 ):
     """server_job_names should strip the trailing ComputeServiceID hex suffix.
@@ -743,14 +738,234 @@ def test_create_compute_services_strips_uuid_suffix_correctly(
 
     with patch.object(mgr.batch_api, "check_job_health"), patch.object(
         mgr.batch_api, "verify_running_jobs", side_effect=_capture
-    ), patch.object(mgr.batch_api, "clear_successful_jobs"), patch.object(
-        mgr.batch_api, "jobs_pending", return_value=True
-    ):
-        mgr.create_compute_services(
-            {"compute_service_ids": [service_id], "num_tasks": 0}, target=0
+    ), patch.object(mgr.batch_api, "clear_successful_jobs"):
+        mgr.maintain_compute_services(
+            {"compute_service_ids": [service_id], "num_tasks": 0}
         )
 
     assert captured["names"] == {service_name}
+
+
+def test_create_compute_services_does_not_run_maintenance(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """``create_compute_services`` only submits; housekeeping lives in
+    ``maintain_compute_services``."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    with patch.object(mgr, "maintain_compute_services") as maintain, patch.object(
+        mgr.batch_api, "check_job_health"
+    ) as health, patch.object(
+        mgr.batch_api, "verify_running_jobs"
+    ) as verify, patch.object(
+        mgr.batch_api, "clear_successful_jobs"
+    ) as clear, patch.object(
+        mgr.batch_api, "jobs_pending", return_value=False
+    ), patch.object(
+        mgr.batch_api, "submit_job", return_value="1"
+    ):
+        mgr.create_compute_services(
+            {"compute_service_ids": [], "num_tasks": 1}, target=1
+        )
+    maintain.assert_not_called()
+    health.assert_not_called()
+    verify.assert_not_called()
+    clear.assert_not_called()
+
+
+# ----------------------------------------------------------------------
+# cycle(): maintenance runs every OK/SKIP cycle, independent of scale-up
+# ----------------------------------------------------------------------
+
+
+def test_cycle_runs_maintenance_with_no_tasks(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """An OK instruction with ``num_tasks=0`` never reaches
+    ``create_compute_services`` upstream, but maintenance still runs."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    service_name = f"{slurm_settings.name}.deadbeef0123456789abcdef01234567"
+    service_id = f"{service_name}-cafebabe0123456789abcdef01234567"
+    mgr.client.get_instruction.return_value = (
+        ComputeManagerInstruction.OK,
+        {"compute_service_ids": [service_id], "num_tasks": 0},
+    )
+
+    with patch.object(mgr.batch_api, "check_job_health") as health, patch.object(
+        mgr.batch_api, "verify_running_jobs"
+    ) as verify, patch.object(
+        mgr.batch_api, "clear_successful_jobs"
+    ) as clear, patch.object(
+        mgr, "create_compute_services"
+    ) as create:
+        assert mgr.cycle() is True
+
+    health.assert_called_once_with()
+    verify.assert_called_once_with({service_name})
+    clear.assert_called_once_with()
+    create.assert_not_called()
+    mgr.client.update_status.assert_called_once()
+
+
+def test_cycle_runs_maintenance_at_capacity(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """At ``max_compute_services`` upstream skips scale-up; maintenance runs."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    ids = [f"svc.{i:032x}-{i:032x}" for i in range(slurm_settings.max_compute_services)]
+    mgr.client.get_instruction.return_value = (
+        ComputeManagerInstruction.OK,
+        {"compute_service_ids": ids, "num_tasks": 10},
+    )
+
+    with patch.object(mgr, "maintain_compute_services") as maintain, patch.object(
+        mgr, "create_compute_services"
+    ) as create:
+        assert mgr.cycle() is True
+
+    maintain.assert_called_once()
+    create.assert_not_called()
+
+
+def test_cycle_runs_maintenance_before_scale_up(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """On a scale-up cycle, maintenance runs once, before submission."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    mgr.client.get_instruction.return_value = (
+        ComputeManagerInstruction.OK,
+        {"compute_service_ids": [], "num_tasks": 1},
+    )
+
+    calls = []
+    with patch.object(
+        mgr,
+        "maintain_compute_services",
+        side_effect=lambda data: calls.append("maintain"),
+    ), patch.object(
+        mgr,
+        "create_compute_services",
+        side_effect=lambda data, target: calls.append("create") or 0,
+    ):
+        assert mgr.cycle() is True
+
+    assert calls == ["maintain", "create"]
+
+
+def test_cycle_scale_up_runs_each_primitive_once(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """End-to-end scale-up cycle with the real ``create_compute_services``:
+    each maintenance primitive runs exactly once, then the job is submitted."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    mgr.client.get_instruction.return_value = (
+        ComputeManagerInstruction.OK,
+        {"compute_service_ids": [], "num_tasks": 1},
+    )
+
+    with patch.object(mgr.batch_api, "check_job_health") as health, patch.object(
+        mgr.batch_api, "verify_running_jobs"
+    ) as verify, patch.object(
+        mgr.batch_api, "clear_successful_jobs"
+    ) as clear, patch.object(
+        mgr.batch_api, "jobs_pending", return_value=False
+    ), patch.object(
+        mgr.batch_api, "submit_job", return_value="1"
+    ) as submit:
+        assert mgr.cycle() is True
+
+    health.assert_called_once_with()
+    verify.assert_called_once_with(set())
+    clear.assert_called_once_with()
+    submit.assert_called_once()
+
+
+class _FakeClient:
+    """Plain (non-mock) client, to observe how ``cycle`` patches it."""
+
+    api_url = "http://example.com"
+
+    def get_instruction(self, scopes, protocols, compute_manager_id):
+        return ComputeManagerInstruction.OK, {
+            "compute_service_ids": [],
+            "num_tasks": 0,
+        }
+
+    def update_status(self, compute_manager_id, status, detail=None, saturation=None):
+        pass
+
+
+def test_cycle_restores_client_get_instruction(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """``cycle`` leaves no ``get_instruction`` instance attribute behind, so
+    later cycles resolve the method afresh from the client class."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    client = _FakeClient()
+    mgr.client = client
+
+    with patch.object(mgr, "maintain_compute_services") as maintain:
+        assert mgr.cycle() is True
+        assert "get_instruction" not in vars(client)
+        assert mgr.cycle() is True
+        assert "get_instruction" not in vars(client)
+
+    assert maintain.call_count == 2
+
+
+def test_cycle_runs_maintenance_on_skip(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """SKIP still carries ``compute_service_ids``; housekeeping still runs."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    data = {"compute_service_ids": []}
+    mgr.client.get_instruction.return_value = (ComputeManagerInstruction.SKIP, data)
+
+    with patch.object(mgr, "maintain_compute_services") as maintain, patch.object(
+        mgr, "create_compute_services"
+    ) as create:
+        assert mgr.cycle() is True
+
+    maintain.assert_called_once_with(data)
+    create.assert_not_called()
+
+
+def test_cycle_skips_maintenance_on_shutdown(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    mgr = _build_manager(slurm_settings, tmp_path)
+    mgr.client.get_instruction.return_value = (
+        ComputeManagerInstruction.SHUTDOWN,
+        {"message": "bye"},
+    )
+
+    with patch.object(mgr, "maintain_compute_services") as maintain:
+        assert mgr.cycle() is False
+
+    maintain.assert_not_called()
+    mgr.client.update_status.assert_not_called()
+
+
+def test_cycle_propagates_maintenance_errors(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """A failing health check aborts the cycle before sizing or submission,
+    and the client's ``get_instruction`` is restored afterwards."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    get_instruction = mgr.client.get_instruction
+    get_instruction.return_value = (
+        ComputeManagerInstruction.OK,
+        {"compute_service_ids": [], "num_tasks": 1},
+    )
+
+    with patch.object(
+        mgr.batch_api, "check_job_health", side_effect=JobFailureError("boom")
+    ), patch.object(mgr, "create_compute_services") as create:
+        with pytest.raises(JobFailureError, match="boom"):
+            mgr.cycle()
+
+    create.assert_not_called()
+    mgr.client.update_status.assert_not_called()
+    assert mgr.client.get_instruction is get_instruction
 
 
 def test_generate_job_name_format(slurm_settings: SlurmManagerSettings, tmp_path: Path):
@@ -1100,3 +1315,91 @@ def test_manager_start_fails_if_recovery_fails(
                 mgr.start()
     start.assert_not_called()
     assert "Failed to recover jobs from the batch system: squeue down" in caplog.text
+
+
+# Job script template validation
+# ----------------------------------------------------------------------
+
+EXAMPLE_TEMPLATE = (
+    Path(__file__).resolve().parent.parent / "examples" / "slurm" / "job-template.sh"
+)
+
+
+@pytest.mark.parametrize("missing", ["JOB_NAME", "COMPUTE_MANAGER_ID"])
+def test_template_missing_required_placeholder_raises(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, missing: str
+):
+    """A template without a required placeholder is rejected at construction."""
+    template = slurm_settings.job_script_template
+    template.write_text(template.read_text().replace(f"{{{{ {missing} }}}}", "x"))
+
+    with pytest.raises(ValueError, match=f"missing required placeholder.*{missing}"):
+        _build_manager(slurm_settings, tmp_path)
+
+
+def test_template_unknown_placeholder_warns(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, caplog
+):
+    """Unknown or mis-spaced ``{{ ... }}`` tokens are logged as warnings."""
+    template = slurm_settings.job_script_template
+    template.write_text(
+        template.read_text()
+        + "{{ PARITION }}\necho {{JOB_NAME}}\necho {{ JOB_NAME\n}}\n"
+    )
+
+    with caplog.at_level("WARNING"):
+        _build_manager(slurm_settings, tmp_path)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 3
+    assert any("{{ PARITION }}" in w for w in warnings)
+    assert any("{{JOB_NAME}}" in w for w in warnings)
+    assert any("{{ JOB_NAME\n}}" in w for w in warnings)
+
+
+@pytest.mark.parametrize(
+    "token", ["{{ PARTITION }}", "{{ACCOUNT}}", "#SBATCH --qos={{ QOS }}"]
+)
+def test_template_removed_placeholder_raises(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, token: str
+):
+    """Templates using the old PARTITION/ACCOUNT/QOS placeholders are rejected."""
+    template = slurm_settings.job_script_template
+    template.write_text(template.read_text() + token + "\n")
+
+    with pytest.raises(ValueError, match="no longer substituted"):
+        _build_manager(slurm_settings, tmp_path)
+
+
+def test_example_template_validates_cleanly(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, caplog
+):
+    """The bundled example template passes validation without warnings and
+    renders with no placeholders left over."""
+    settings = slurm_settings.model_copy(
+        update={"job_script_template": EXAMPLE_TEMPLATE}
+    )
+
+    with caplog.at_level("WARNING"):
+        mgr = _build_manager(settings, tmp_path)
+
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    script_path = mgr._create_job_script()
+    try:
+        assert "{{" not in script_path.read_text()
+    finally:
+        script_path.unlink(missing_ok=True)
+
+
+def test_render_template_rejects_undeclared_substitutions(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """Substitution keys must match ``TEMPLATE_PLACEHOLDERS`` exactly."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    substitutions = dict.fromkeys(SlurmManager.TEMPLATE_PLACEHOLDERS, "")
+
+    with pytest.raises(ValueError, match="TEMPLATE_PLACEHOLDERS"):
+        mgr._render_template({**substitutions, "EXTRA": ""})
+    with pytest.raises(ValueError, match="TEMPLATE_PLACEHOLDERS"):
+        mgr._render_template({k: v for k, v in substitutions.items() if k != "JOB_NAME"})

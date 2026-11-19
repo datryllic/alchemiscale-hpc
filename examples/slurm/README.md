@@ -35,14 +35,14 @@ cp examples/slurm/service-config.yml my-service-config.yml
 - Update `SERVICE_CONFIG` path to point to your service config file
 
 **Edit `my-manager-config.yml`:**
-- Set `name` to a unique identifier for this manager. SLURM job names are
-  built as `<name>.<uuid_hex>`, so `name` must start with a letter and contain
-  only letters, digits, `_`, `.`, and `:` (no `-`). Keep it unique across all
-  managers on the cluster account, including ones pointed at other
-  alchemiscale servers; the server only rejects duplicates among managers
-  registered with it
+- Set `name` for this manager. SLURM job names are built as
+  `<name>.<uuid_hex>`, so `name` must start with a letter and contain only
+  letters, digits, `_`, `.`, and `:` (no `-`). The manager recognizes its jobs
+  by name, so managers running under the same cluster user need different
+  names, even if they use different alchemiscale servers. Managers under
+  different users can share a name
 - Set `job_script_template` to the path of your job template
-- Configure `partition`, `account`, `qos` for your SLURM system
+- Configure `partition`, `account`, `qos` for your SLURM system; the manager passes them to `sbatch` on the command line, overriding matching `#SBATCH` directives in the template
 - Set `max_compute_services` based on your resource allocation
 - Adjust `sleep_interval` and `max_submit_per_cycle` for your scaling needs
 - Set `logfile` path
@@ -214,7 +214,7 @@ until the job ends or you cancel it with `scancel`.
 6. **Manager tracks** job IDs and cleans up completed/failed jobs. On
    startup, it recovers its queued jobs from `squeue` by job name, so a
    restarted manager does not submit on top of jobs that are still pending.
-   This is why `name` must be unique per cluster account.
+   This is why managers under the same cluster user need different names.
 
 ### Job Lifecycle
 
