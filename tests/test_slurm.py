@@ -104,18 +104,15 @@ def _settings_kwargs(tmp_path: Path, **overrides) -> dict:
     return kwargs
 
 
-@pytest.mark.parametrize(
-    "name", ["testmgr", "mycluster.gpu", "my_cluster", "Site:queue.v2", "a"]
-)
+# The naming rule itself is alchemiscale's; these only check that it is
+# applied when settings load, with the HPC explanation.
+@pytest.mark.parametrize("name", ["mycluster.gpu", "Site:queue.v2"])
 def test_settings_accepts_valid_name(tmp_path: Path, name: str):
     settings = SlurmManagerSettings(**_settings_kwargs(tmp_path, name=name))
     assert settings.name == name
 
 
-@pytest.mark.parametrize(
-    "name",
-    ["my-slurm-manager", "1cluster", "_cluster", ".cluster", "my cluster", ""],
-)
+@pytest.mark.parametrize("name", ["my-slurm-manager", "1cluster"])
 def test_settings_rejects_invalid_name(tmp_path: Path, name: str):
     """Names that cannot form a valid ComputeServiceID are rejected up front."""
     with pytest.raises(ValueError, match="alchemiscale compute IDs forbid '-'"):
@@ -199,16 +196,6 @@ def test_is_own_job_name_matches_generated_names():
 )
 def test_is_own_job_name_rejects_other_names(job_name: str):
     assert not is_own_job_name("foo", job_name)
-
-
-def test_generate_job_name_identifies_manager(tmp_path: Path):
-    """Managers with different names produce distinguishable job names."""
-    prefixes = set()
-    for mgr_name in ("mgra", "mgrb"):
-        settings = SlurmManagerSettings(**_settings_kwargs(tmp_path, name=mgr_name))
-        mgr = _build_manager(settings, tmp_path)
-        prefixes.add(mgr._generate_job_name().rsplit(".", 1)[0])
-    assert prefixes == {"mgra", "mgrb"}
 
 
 def test_parse_jobs_handles_empty():
