@@ -3,9 +3,14 @@
 # This file configures the compute manager that autoscales compute services
 # by submitting SLURM batch jobs based on task availability.
 
-# Unique name for this manager (required)
-# Should be distinct from all other compute managers
-name: "my-slurm-manager"
+# Name for this manager (required)
+# The alchemiscale server refuses a second manager registered under the same
+# name. The manager also recognizes its SLURM jobs by name
+# (<name>.<uuid_hex>), so managers running under the same cluster user must
+# have different names, even if they use different alchemiscale servers.
+# It must start with a letter and contain only letters, digits, underscores,
+# periods, and colons (no hyphens).
+name: "my_slurm_manager"
 
 # Path to SLURM job script template (required)
 # The manager will use this template to generate job scripts
@@ -26,11 +31,6 @@ account: "myaccount"
 
 # Quality of Service specification
 qos: "normal"
-
-# Prefix for SLURM job names.
-# Full job name will be: <prefix>.<uuid_hex>
-# (Matches the alchemiscale-k8s naming convention.)
-job_name_prefix: "alchemiscale"
 
 # Manager behavior settings
 
