@@ -73,8 +73,8 @@ alchemiscale-hpc slurm clear-error -c manager-config.yml -s service-config.yml
 # Show SLURM jobs
 alchemiscale-hpc slurm show-jobs -c manager-config.yml
 
-# Cleanup completed/failed jobs
-alchemiscale-hpc slurm cleanup -c manager-config.yml --failed --completed
+# Show this manager's jobs, including recently finished ones
+alchemiscale-hpc slurm show-jobs -c manager-config.yml --mine --finished
 ```
 
 ### LSF (Coming Soon)

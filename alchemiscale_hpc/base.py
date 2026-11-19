@@ -316,19 +316,21 @@ class HPCBatchApi(ABC):
       while prior submissions are still queueing
     * :meth:`submit_job` --- the actual submission
     * :meth:`recover_jobs` --- rebuild ``tracked_jobs`` from the batch
-      system; called once at startup (and by ``cleanup``)
+      system; called once at startup (and by ``show-jobs --mine``)
 
     **Operator/diagnostic primitives** (only invoked by the
     ``alchemiscale-hpc <backend> ...`` CLI; the autoscaling loop never
     calls these):
 
     * :meth:`get_jobs` --- backs ``show-jobs``
-    * :meth:`clear_failed_jobs` --- backs ``cleanup --failed``
 
     The split reflects intent, not optionality. The CLI is part of the
     operator interface for any production deployment, so a backend that
-    leaves ``get_jobs`` or ``clear_failed_jobs`` as no-ops is shipping a
-    half-finished operator experience.
+    leaves ``get_jobs`` as a no-op is shipping a half-finished operator
+    experience.
+
+    :meth:`clear_failed_jobs` untracks failed jobs; the manager loop does
+    not call it yet (see #7).
     """
 
     def __init__(self, settings: HPCManagerSettings):
@@ -432,7 +434,7 @@ class HPCBatchApi(ABC):
         managers under the same cluster user having different names.
 
         Called once by :meth:`HPCManager.start` before the first cycle, and by
-        the ``cleanup`` CLI command.
+        the ``show-jobs --mine`` CLI command.
 
         Parameters
         ----------
@@ -467,12 +469,10 @@ class HPCBatchApi(ABC):
 
     @abstractmethod
     def clear_failed_jobs(self) -> None:
-        """Operator-driven cleanup hook for failed jobs. Backs
-        ``alchemiscale-hpc <backend> cleanup --failed``.
+        """Untrack failed jobs.
 
-        Mirrors :meth:`clear_successful_jobs` but for failed jobs. Not called
-        on every cycle; only reached after an operator has investigated a
-        failure and asked to clear the wreckage.
+        Mirrors :meth:`clear_successful_jobs` but for failed jobs. The
+        manager loop does not call it yet (see #7).
         """
 
 

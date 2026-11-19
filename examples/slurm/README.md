@@ -124,29 +124,25 @@ alchemiscale-hpc slurm clear-error \
     -s my-service-config.yml
 ```
 
-### Cleanup Jobs
+### Show the Manager's Jobs
 
-List the manager's failed jobs:
-
-```bash
-alchemiscale-hpc slurm cleanup -c my-manager-config.yml --failed
-```
-
-List the manager's successful jobs:
+List the manager's queued and running jobs:
 
 ```bash
-alchemiscale-hpc slurm cleanup -c my-manager-config.yml --successful
+alchemiscale-hpc slurm show-jobs -c my-manager-config.yml --mine
 ```
 
-`cleanup` finds the manager's jobs by name in `squeue` and, for jobs that
-finished in the last 7 days, in `sacct`, and reports the failed or successful
-ones. For SLURM, this is all it does: it clears them only from its own
-in-memory tracking, so SLURM accounting (`sacct`) records, job scripts, and a
-running manager are unaffected. A manager forgets finished jobs when it
-restarts. (The same `cleanup` command on a Kubernetes-style backend would
-actually delete the corresponding Job objects.) To prevent job scripts from
-being removed automatically after submission (useful for debugging), set
-`keep_job_scripts: true` in the manager config.
+Add `--finished` to also list the jobs that finished in the last 7 days, with
+their final state, from `sacct`:
+
+```bash
+alchemiscale-hpc slurm show-jobs -c my-manager-config.yml --mine --finished
+```
+
+The manager's jobs are found by name, with the same queries the manager uses
+when it starts. SLURM keeps finished jobs only as accounting records, so there
+is nothing to clean up. To keep job scripts after submission (useful for
+debugging), set `keep_job_scripts: true` in the manager config.
 
 ### Restarting After an Error
 

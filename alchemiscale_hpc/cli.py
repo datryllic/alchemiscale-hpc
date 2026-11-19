@@ -2,7 +2,7 @@
 
 The CLI is generated automatically from the backend registry. Each backend
 that registers itself via :func:`alchemiscale_hpc.base.register_backend`
-gains a ``alchemiscale-hpc <backend> {start,clear-error,show-jobs,cleanup}``
+gains a ``alchemiscale-hpc <backend> {start,clear-error,show-jobs}``
 subcommand group, with no further changes required to this module.
 
 Stub backends (currently LSF and PBS) register a placeholder name without a
@@ -104,14 +104,28 @@ def _build_backend_group(backend: str) -> click.Group:
         is_flag=True,
         help="Show only jobs submitted by the manager named in the config.",
     )
-    def show_jobs(config_file: Path, mine: bool) -> None:
+    @click.option(
+        "--finished",
+        is_flag=True,
+        help=(
+            "With --mine, also show the manager's jobs that finished recently, "
+            "from the batch system's accounting records."
+        ),
+    )
+    def show_jobs(config_file: Path, mine: bool, finished: bool) -> None:
+        if finished and not mine:
+            raise click.UsageError("--finished requires --mine")
+
         _, _, batch_api_cls = _base.get_backend(backend)
         settings = _load_settings(config_file, backend)
         batch_api = batch_api_cls(settings)
 
-        jobs = batch_api.get_jobs()
+        # recover_jobs finds the manager's jobs by name, with the same
+        # queries the manager uses at startup.
         if mine:
-            jobs = [j for j in jobs if _base.is_own_job_name(settings.name, j["name"])]
+            jobs = batch_api.recover_jobs(include_finished=finished)
+        else:
+            jobs = batch_api.get_jobs()
         if not jobs:
             click.echo(f"No jobs found in {backend.upper()} queue")
             return
@@ -120,62 +134,6 @@ def _build_backend_group(backend: str) -> click.Group:
         click.echo("-" * 57)
         for job in jobs:
             click.echo(f"{job['job_id']:<12} {job['name']:<30} {job['state']:<15}")
-
-    @group.command(
-        name="cleanup",
-        help=(
-            f"Find this manager's successful and/or failed {backend.upper()} "
-            "jobs and clear them from tracking."
-        ),
-    )
-    @config_option
-    @click.option("--failed", is_flag=True, help="Clear failed jobs.")
-    @click.option(
-        "--successful",
-        "--completed",
-        "successful",
-        is_flag=True,
-        help="Clear successful jobs.",
-    )
-    def cleanup(config_file: Path, failed: bool, successful: bool) -> None:
-        if not failed and not successful:
-            click.echo("Please specify at least one of --failed or --successful")
-            return
-
-        _, _, batch_api_cls = _base.get_backend(backend)
-        settings = _load_settings(config_file, backend)
-        batch_api = batch_api_cls(settings)
-        # This process has no in-memory state; find the manager's jobs,
-        # including recently finished ones, in the batch system.
-        batch_api.recover_jobs(include_finished=True)
-
-        def _clear(kind: str, setting: str, clear) -> None:
-            if not getattr(settings, setting, True):
-                click.echo(f"Skipping {kind} jobs: {setting} is false in the config")
-                return
-            before = set(batch_api.tracked_jobs)
-            clear()
-            found = sorted(before - batch_api.tracked_jobs)
-            click.echo(
-                f"Found {len(found)} {kind} job(s) of manager {settings.name!r}"
-                + (f": {', '.join(found)}" if found else "")
-            )
-
-        if failed:
-            _clear("failed", "cleanup_failed_jobs", batch_api.clear_failed_jobs)
-
-        if successful:
-            _clear(
-                "successful",
-                "cleanup_successful_jobs",
-                batch_api.clear_successful_jobs,
-            )
-
-        # Clearing only affects this process's tracking; say so plainly.
-        click.echo(
-            f"{backend.upper()} records are unchanged, and a running manager is "
-            "unaffected; a manager forgets finished jobs when it restarts."
-        )
 
     return group
 
@@ -215,7 +173,7 @@ def _build_stub_group(backend: str, label: str) -> click.Group:
 
         return stub
 
-    for subcommand in ("start", "clear-error", "show-jobs", "cleanup"):
+    for subcommand in ("start", "clear-error", "show-jobs"):
         group.add_command(_make_stub(subcommand))
 
     return group
