@@ -74,17 +74,14 @@ max_consecutive_failed_cycles: 5
 #
 # For SLURM, "cleanup" means removing job IDs from the manager's in-memory
 # tracking set. SLURM accounting (sacct) records are immutable history and
-# are not modified by these flags. (Other backends — e.g. Kubernetes — can
-# interpret these flags as actually deleting Job objects from the batch
+# are not modified by this flag. (Other backends — e.g. Kubernetes — can
+# interpret this flag as actually deleting Job objects from the batch
 # system.)
 
 # Run the per-cycle clear_successful_jobs step (default: true). Leave it on:
 # a completed job counts as a sign of health for max_consecutive_failed_cycles,
 # and with it off, completed jobs stay tracked and are queried every cycle.
 cleanup_successful_jobs: true
-
-# cleanup_failed_jobs is ignored, and setting it to false warns: failed jobs
-# are always logged once and dropped from tracking.
 
 # Job script handling
 

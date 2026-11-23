@@ -77,7 +77,6 @@ def test_slurm_settings_extends_script_template_base():
     assert {
         "job_script_template",
         "cleanup_successful_jobs",
-        "cleanup_failed_jobs",
         "keep_job_scripts",
         "job_script_dir",
         "job_registration_grace_period",
@@ -317,19 +316,6 @@ def test_clear_failed_jobs_ignores_requeued_jobs(
     with patch("subprocess.run", side_effect=run):
         assert api.clear_failed_jobs() == {}
     assert api.tracked_jobs == {"1"}
-
-
-def test_clear_failed_jobs_ignores_cleanup_setting(
-    slurm_settings: SlurmManagerSettings,
-):
-    """A failed job left tracked would be reported again every cycle, so
-    ``cleanup_failed_jobs: false`` does not keep it tracked."""
-    api = SlurmBatchApi(slurm_settings.model_copy(update={"cleanup_failed_jobs": False}))
-    _track(api, "1")
-    run, _ = _fake_slurm(sacct_tracked="1|FAILED|1:0|None|x\n")
-    with patch("subprocess.run", side_effect=run):
-        assert api.clear_failed_jobs() == {"1": "FAILED, exit code 1"}
-    assert api.tracked_jobs == set()
 
 
 # ----------------------------------------------------------------------
@@ -1529,22 +1515,6 @@ def test_settings_max_consecutive_failed_cycles(tmp_path: Path):
         SlurmManagerSettings(
             **_settings_kwargs(tmp_path, max_consecutive_failed_cycles=-1)
         )
-
-
-def test_settings_cleanup_failed_jobs_false_warns(tmp_path: Path, caplog):
-    """``cleanup_failed_jobs: false`` no longer keeps failed jobs tracked, so
-    setting it warns, and the manager repeats the warning in its log."""
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        SlurmManagerSettings(**_settings_kwargs(tmp_path))
-        SlurmManagerSettings(**_settings_kwargs(tmp_path, cleanup_failed_jobs=True))
-    with pytest.warns(FutureWarning, match="cleanup_failed_jobs=False is ignored"):
-        settings = SlurmManagerSettings(
-            **_settings_kwargs(tmp_path, cleanup_failed_jobs=False)
-        )
-    with caplog.at_level("WARNING", logger="AlchemiscaleComputeManager"):
-        _build_manager(settings, tmp_path)
-    assert "cleanup_failed_jobs=False is ignored" in caplog.text
 
 
 def test_single_failed_job_is_logged_untracked_and_tolerated(

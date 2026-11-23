@@ -157,7 +157,7 @@ class SlurmBatchApi(HPCBatchApi):
         The reason combines sacct's ``State`` (e.g. ``TIMEOUT``,
         ``CANCELLED by 1000``), ``ExitCode``, and ``Reason``. Same caveat as
         :meth:`clear_successful_jobs`: this is purely in-memory; ``sacct``
-        records are not modified. ``cleanup_failed_jobs`` is ignored, since a
+        records are not modified. Failed jobs are always untracked, since a
         failed job left tracked would be reported again every cycle. sacct's
         ``Reason`` is the last reason the job was pending, so it is labeled
         as such.

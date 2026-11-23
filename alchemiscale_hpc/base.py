@@ -310,37 +310,6 @@ class ScriptTemplateHPCManagerSettings(HPCManagerSettings):
             "tracked, and queries them every cycle."
         ),
     )
-    cleanup_failed_jobs: bool = Field(
-        True,
-        description=(
-            "Ignored. Failed jobs are always logged once, with their reason, "
-            "and dropped from the manager's in-memory tracking, since a failed "
-            "job left tracked would be reported again every cycle; batch "
-            "system records (e.g. ``sacct``) are kept regardless. Setting it "
-            "to false emits a FutureWarning."
-        ),
-    )
-
-    # Warning emitted because the config set ``cleanup_failed_jobs: false``,
-    # so the manager can repeat it in its own log.
-    _cleanup_failed_jobs_warning: Optional[str] = PrivateAttr(None)
-
-    @model_validator(mode="after")
-    def _warn_cleanup_failed_jobs_ignored(self):
-        """Warn when a config sets ``cleanup_failed_jobs: false``, which used
-        to keep failed jobs tracked and now has no effect."""
-        if "cleanup_failed_jobs" in self.model_fields_set and not (
-            self.cleanup_failed_jobs
-        ):
-            message = (
-                "cleanup_failed_jobs=False is ignored; failed jobs are always "
-                "logged once, with their reason, and dropped from tracking, "
-                "and batch system records are kept regardless. Remove "
-                "cleanup_failed_jobs from the config."
-            )
-            self._cleanup_failed_jobs_warning = message
-            warnings.warn(message, FutureWarning)
-        return self
 
 
 class HPCBatchApi(ABC):
@@ -571,10 +540,8 @@ class HPCManager(ComputeManager, ABC):
         service_settings = ComputeServiceSettings(**service_settings_dict)
         super().__init__(settings=settings, service_settings=service_settings)
 
-        for attr in ("_job_name_prefix_warning", "_cleanup_failed_jobs_warning"):
-            settings_warning = getattr(settings, attr, None)
-            if settings_warning is not None:
-                self.logger.warning(settings_warning)
+        if settings._job_name_prefix_warning is not None:
+            self.logger.warning(settings._job_name_prefix_warning)
 
         # Subclasses provide the concrete batch API via _create_batch_api().
         self.batch_api: HPCBatchApi = self._create_batch_api()
