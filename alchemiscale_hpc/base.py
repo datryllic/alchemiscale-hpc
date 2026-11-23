@@ -180,8 +180,7 @@ class HPCManagerSettings(ComputeManagerSettings):
             "this many cycles that submit while no compute service of this "
             "manager is registered. With a short sleep_interval, raise this "
             "limit so that a brief scheduler outage does not stop the "
-            "manager. Jobs cancelled by the operator count as failed too. "
-            "0 stops on the first failure; null never stops."
+            "manager. Cancelled jobs do not count as failed. 0 stops on the first failure; null never stops."
         ),
     )
 
@@ -330,6 +329,8 @@ class HPCBatchApi(ABC):
 
     * :meth:`clear_failed_jobs` --- untrack failed jobs and report why
       they failed
+    * :meth:`clear_cancelled_jobs` --- untrack cancelled jobs, which do not
+      count as failed
     * :meth:`find_unregistered_jobs` --- find running jobs that are not
       registered with the alchemiscale server
     * :meth:`clear_successful_jobs` --- per-cycle cleanup of finished jobs
@@ -412,6 +413,19 @@ class HPCBatchApi(ABC):
         decides whether to stop, and once at startup for jobs recovered by
         :meth:`recover_jobs`. For Kubernetes-style backends, clearing would
         also delete the job from the batch system.
+
+        Cancelled jobs are not failed jobs; see :meth:`clear_cancelled_jobs`.
+        """
+
+    @abstractmethod
+    def clear_cancelled_jobs(self) -> Dict[str, str]:
+        """Stop tracking cancelled jobs, returning ``{job_id: reason}``.
+
+        A cancelled job was stopped by an operator or administrator, so it
+        says nothing about whether the job script and settings work. Like
+        :meth:`clear_failed_jobs`, each job is returned once. Called every
+        ``OK``/``SKIP`` cycle by :meth:`HPCManager.handle_finished_jobs`,
+        which logs them without counting them as failures.
         """
 
     @abstractmethod
@@ -593,8 +607,9 @@ class HPCManager(ComputeManager, ABC):
         One WARNING summarizes them, with each job and its reason at INFO.
         They do not count toward ``max_consecutive_failed_cycles``: some were
         already reported before the restart, and a restart should not bring
-        the manager closer to stopping. Jobs that completed before startup
-        are untracked too, without counting as a sign of health; otherwise,
+        the manager closer to stopping. Jobs that completed or were
+        cancelled before startup are untracked too, unreported and without
+        counting as a sign of health; otherwise,
         with ``cleanup_successful_jobs`` off, they would stay tracked for the
         life of the manager.
 
@@ -631,10 +646,10 @@ class HPCManager(ComputeManager, ABC):
         return any(is_own_job_name(self.settings.name, n) for n in server_job_names)
 
     def handle_finished_jobs(self, server_job_names: Set[str]) -> Dict[str, str]:
-        """Clear successful jobs, and log and untrack failed jobs, raising
-        :class:`JobFailureError` if failed jobs are found in more than
-        ``max_consecutive_failed_cycles`` checks without a sign of health in
-        between. Returns ``{job_id: failure reason}``.
+        """Clear successful and cancelled jobs, and log and untrack failed
+        jobs, raising :class:`JobFailureError` if failed jobs are found in
+        more than ``max_consecutive_failed_cycles`` checks without a sign of
+        health in between. Returns ``{job_id: failure reason}``.
 
         Each call is one check, so call it once per cycle. A check that sees
         a sign of health, meaning a job of this manager completed or one of
@@ -648,7 +663,11 @@ class HPCManager(ComputeManager, ABC):
         registering, stop the manager loudly. Resetting only on a sign of
         health, rather than on any check without failures, matters when jobs
         pend: a check that only sees pending jobs says nothing either way.
+        Cancelled jobs are logged, but neither count nor reset: someone
+        stopped them, so they say nothing either way too.
         """
+        for job_id, reason in self.batch_api.clear_cancelled_jobs().items():
+            self.logger.info(f"Batch job {job_id} was cancelled: {reason}")
         failed = self.batch_api.clear_failed_jobs()
         for job_id, reason in failed.items():
             self.logger.error(f"Batch job {job_id} failed: {reason}")

@@ -127,14 +127,14 @@ alchemiscale-hpc slurm clear-error \
 
 ### Failed Jobs
 
-A failed job (`FAILED`, `TIMEOUT`, `CANCELLED`, `NODE_FAIL`, `PREEMPTED`,
-`OUT_OF_MEMORY`, `BOOT_FAIL`, `DEADLINE`) does not stop the manager. Each
+A failed job (`FAILED`, `TIMEOUT`, `NODE_FAIL`, `PREEMPTED`, `OUT_OF_MEMORY`,
+`BOOT_FAIL`, `DEADLINE`) does not stop the manager. Each
 cycle that checks its jobs, the manager logs every newly failed job at ERROR
 with its `sacct` state and exit code (and last pending reason, if any), for
 example:
 
 ```
-Batch job 4242 failed: CANCELLED by 1000, exit code 0, signal 15
+Batch job 4242 failed: TIMEOUT, exit code 0
 ```
 
 and stops tracking it. The manager stops with `JobFailureError` only if
@@ -149,10 +149,11 @@ still registered keeps resetting the count until it ends (up to its
 walltime); only then does the limit apply. The new jobs' failures are
 logged at ERROR throughout.
 
-Jobs you cancel yourself with `scancel` are recorded as `CANCELLED` and count
-as failed too. Cancelling several while none of the manager's compute services
-is registered can stop it; stop the manager first if you need to cancel many
-of its jobs.
+A cancelled job (`CANCELLED`, e.g. from `scancel`) is not a failed job: it
+was stopped by someone, so it says nothing about the template or settings.
+The manager logs it at INFO, e.g. `Batch job 4243 was cancelled: CANCELLED by
+1000, exit code 0, signal 15`, and stops tracking it; it neither counts toward
+the limit nor resets it.
 
 Without SLURM accounting (`sacct`), the manager cannot see failed jobs at all:
 it logs a WARNING at startup, and `max_consecutive_failed_cycles` never stops
@@ -289,10 +290,10 @@ with `JobNotFoundError` again, until the job ends or you cancel it with
 - **PENDING**: Job is queued in SLURM, waiting for resources
 - **RUNNING**: Job is executing, compute service is active
 - **COMPLETED**: Job finished successfully, service deregistered
-- **FAILED** (or `TIMEOUT`, `CANCELLED`, `NODE_FAIL`, `PREEMPTED`,
-  `OUT_OF_MEMORY`, `BOOT_FAIL`, `DEADLINE`): manager
-  logs the reason and carries on; it stops only if jobs fail cycle after cycle
-  (see [Failed Jobs](#failed-jobs))
+- **FAILED** (or `TIMEOUT`, `NODE_FAIL`, `PREEMPTED`, `OUT_OF_MEMORY`,
+  `BOOT_FAIL`, `DEADLINE`): manager logs the reason and carries on; it stops
+  only if jobs fail cycle after cycle (see [Failed Jobs](#failed-jobs))
+- **CANCELLED**: manager logs it and carries on; never counts as failed
 
 ## Troubleshooting
 

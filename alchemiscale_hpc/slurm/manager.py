@@ -17,11 +17,13 @@ from ..base import (
 from .settings import SlurmManagerSettings
 
 # SLURM job states considered "failed": every terminal state in sacct's JOB
-# STATE CODES other than COMPLETED. sacct prints a cancelled job's state as
-# ``CANCELLED by <uid>``.
+# STATE CODES other than COMPLETED and CANCELLED. A cancelled job was stopped
+# by someone (``scancel``), so says nothing about the job script or settings;
+# see ``clear_cancelled_jobs``. sacct prints its state as ``CANCELLED by <uid>``.
 SLURM_FAILED_STATES = (
-    "FAILED,TIMEOUT,CANCELLED,NODE_FAIL,PREEMPTED,OUT_OF_MEMORY,BOOT_FAIL,DEADLINE"
+    "FAILED,TIMEOUT,NODE_FAIL,PREEMPTED,OUT_OF_MEMORY,BOOT_FAIL,DEADLINE"
 )
+SLURM_CANCELLED_STATE = "CANCELLED"
 
 # Field separator for ``squeue``/``sacct`` parsable output. ``%j`` (job name)
 # is user-supplied and SLURM does not restrict commas, spaces, or pipes within
@@ -155,18 +157,31 @@ class SlurmBatchApi(HPCBatchApi):
         ``{job_id: failure reason}``.
 
         The reason combines sacct's ``State`` (e.g. ``TIMEOUT``,
-        ``CANCELLED by 1000``), ``ExitCode``, and ``Reason``. Same caveat as
+        ``NODE_FAIL``), ``ExitCode``, and ``Reason``. Same caveat as
         :meth:`clear_successful_jobs`: this is purely in-memory; ``sacct``
         records are not modified. Failed jobs are always untracked, since a
         failed job left tracked would be reported again every cycle. sacct's
         ``Reason`` is the last reason the job was pending, so it is labeled
         as such.
         """
-        failed = {}
-        for job in self._get_failed_jobs():
-            failed[job["job_id"]] = job["reason"]
+        return self._clear_ended_jobs(SLURM_FAILED_STATES)
+
+    def clear_cancelled_jobs(self) -> Dict[str, str]:
+        """Drop cancelled jobs from the in-memory tracking set, returning
+        ``{job_id: reason}``, e.g. ``CANCELLED by 1000, exit code 0, signal
+        15``. As with :meth:`clear_failed_jobs`, ``sacct`` records are not
+        modified.
+        """
+        return self._clear_ended_jobs(SLURM_CANCELLED_STATE)
+
+    def _clear_ended_jobs(self, states: str) -> Dict[str, str]:
+        """Untrack jobs that ended in one of ``states``, returning
+        ``{job_id: reason}``."""
+        ended = {}
+        for job in self._get_ended_jobs(states):
+            ended[job["job_id"]] = job["reason"]
             self._untrack(job["job_id"])
-        return failed
+        return ended
 
     def jobs_pending(self) -> bool:
         """Return True if any tracked jobs are in PENDING state."""
@@ -268,7 +283,7 @@ class SlurmBatchApi(HPCBatchApi):
                 "-E",
                 "now",
                 "-s",
-                f"COMPLETED,{SLURM_FAILED_STATES}",
+                f"COMPLETED,{SLURM_CANCELLED_STATE},{SLURM_FAILED_STATES}",
                 "-o",
                 _SACCT_RECOVER_FORMAT,
                 "--noheader",
@@ -341,21 +356,21 @@ class SlurmBatchApi(HPCBatchApi):
             self._sacct_query("COMPLETED", self.tracked_jobs, _SACCT_FORMAT)
         )
 
-    def _get_failed_jobs(self) -> List[Dict[str, str]]:
-        """Return tracked failed jobs, each with a ``reason``.
+    def _get_ended_jobs(self, states: str) -> List[Dict[str, str]]:
+        """Return tracked jobs that ended in one of the comma-separated
+        ``states``, each with a ``reason``.
 
-        ``sacct -s`` selects jobs that were in a failed state at any time,
+        ``sacct -s`` selects jobs that were in one of ``states`` at any time,
         so a job that was preempted and requeued could match while it is
-        pending or running again. Only jobs whose current state is a failed
-        state are returned.
+        pending or running again. Only jobs whose current state is one of
+        ``states`` are returned.
         """
-        failed_states = SLURM_FAILED_STATES.split(",")
         jobs = self._parse_failed_jobs(
-            self._sacct_query(
-                SLURM_FAILED_STATES, self.tracked_jobs, _SACCT_FAILED_FORMAT
-            )
+            self._sacct_query(states, self.tracked_jobs, _SACCT_FAILED_FORMAT)
         )
-        return [job for job in jobs if job["state"].split(" ", 1)[0] in failed_states]
+        return [
+            job for job in jobs if job["state"].split(" ", 1)[0] in states.split(",")
+        ]
 
     def _sacct_query(
         self, state_filter: str, job_ids: Iterable[str], fields: str

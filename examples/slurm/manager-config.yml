@@ -56,9 +56,10 @@ max_submit_per_cycle: 2
 # failures faster.
 job_registration_grace_period: 120
 
-# Failed jobs (FAILED, TIMEOUT, CANCELLED, NODE_FAIL, PREEMPTED,
-# OUT_OF_MEMORY, BOOT_FAIL, DEADLINE) are logged with their reason and dropped
-# from tracking whenever the manager checks its jobs. The manager stops with
+# Failed jobs (FAILED, TIMEOUT, NODE_FAIL, PREEMPTED, OUT_OF_MEMORY,
+# BOOT_FAIL, DEADLINE) are logged with their reason and dropped from tracking
+# whenever the manager checks its jobs. Cancelled jobs are too, but never
+# count as failed. The manager stops with
 # JobFailureError only if failed jobs are found in more than this many checks
 # with no sign of a healthy job in between (one of its jobs completing, or
 # one of its compute services registered with the server), which usually

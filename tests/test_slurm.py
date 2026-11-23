@@ -278,13 +278,13 @@ def test_clear_failed_jobs_returns_reasons_and_untracks(
         _track(api, jid)
     run, calls = _fake_slurm(
         sacct_tracked=(
-            "1|CANCELLED by 1000|0:15|None|x\n"
+            "1|FAILED|1:0|None|x\n"
             "2|PREEMPTED|0:0|None|y\n"
         )
     )
     with patch("subprocess.run", side_effect=run):
         assert api.clear_failed_jobs() == {
-            "1": "CANCELLED by 1000, exit code 0, signal 15",
+            "1": "FAILED, exit code 1",
             "2": "PREEMPTED, exit code 0",
         }
     assert api.tracked_jobs == {"3"}
@@ -292,17 +292,40 @@ def test_clear_failed_jobs_returns_reasons_and_untracks(
     assert "--jobs=1,2,3" in cmd
     assert "JobID,State,ExitCode,Reason,JobName" in cmd
     states = set(cmd[cmd.index("-s") + 1].split(","))
-    # Every terminal state other than COMPLETED, per sacct's JOB STATE CODES.
+    # Every terminal state other than COMPLETED and CANCELLED, per sacct's
+    # JOB STATE CODES.
     assert states == {
         "FAILED",
         "TIMEOUT",
-        "CANCELLED",
         "NODE_FAIL",
         "PREEMPTED",
         "OUT_OF_MEMORY",
         "BOOT_FAIL",
         "DEADLINE",
     }
+
+
+def test_cancelled_jobs_are_cleared_separately_from_failed_jobs(
+    slurm_settings: SlurmManagerSettings,
+):
+    """A cancelled job is not returned as failed, but by
+    clear_cancelled_jobs, with its reason, and untracked."""
+    api = SlurmBatchApi(slurm_settings)
+    for jid in ("1", "2"):
+        _track(api, jid)
+    run, calls = _fake_slurm(
+        sacct_tracked=(
+            "1|CANCELLED by 1000|0:15|None|x\n"
+            "2|TIMEOUT|0:0|None|y\n"
+        )
+    )
+    with patch("subprocess.run", side_effect=run):
+        assert api.clear_cancelled_jobs() == {
+            "1": "CANCELLED by 1000, exit code 0, signal 15"
+        }
+        assert api.clear_failed_jobs() == {"2": "TIMEOUT, exit code 0"}
+    assert api.tracked_jobs == set()
+    assert calls[0][calls[0].index("-s") + 1] == "CANCELLED"
 
 
 def test_clear_failed_jobs_ignores_requeued_jobs(
@@ -460,7 +483,7 @@ def test_clear_failed_jobs_removes_from_set_and_times(
         _track(api, jid)
     with patch.object(
         api,
-        "_get_failed_jobs",
+        "_get_ended_jobs",
         return_value=[
             {"job_id": "1", "name": "x", "state": "FAILED", "reason": "FAILED"}
         ],
@@ -1416,7 +1439,7 @@ def test_manager_start_logs_failures_without_counting_them(
     """Jobs that failed while the manager was down are summarized at WARNING
     and listed with their reasons at INFO, untracked, and not counted toward
     max_consecutive_failed_cycles, even with a limit of 0. Jobs that completed
-    before startup are untracked as well."""
+    or were cancelled before startup are untracked as well, unreported."""
     settings = slurm_settings.model_copy(update={"max_consecutive_failed_cycles": 0})
     mgr = _build_manager(settings, tmp_path)
     name = settings.name
@@ -1426,8 +1449,12 @@ def test_manager_start_logs_failures_without_counting_them(
         sacct_user=(
             f"7|TIMEOUT|{ts}|{make_job_name(name)}\n"
             f"8|COMPLETED|{ts}|{make_job_name(name)}\n"
+            f"9|CANCELLED by 1000|{ts}|{make_job_name(name)}\n"
         ),
-        sacct_tracked="7|TIMEOUT|0:0|None|x\n",
+        sacct_tracked=(
+            "7|TIMEOUT|0:0|None|x\n"
+            "9|CANCELLED by 1000|0:15|None|x\n"
+        ),
     )
     with patch("subprocess.run", side_effect=run), patch(
         "alchemiscale.compute.manager.ComputeManager.start"
@@ -1447,7 +1474,7 @@ def test_manager_start_logs_failures_without_counting_them(
     assert ("INFO", "Batch job 7 failed before startup: TIMEOUT, exit code 0") in (
         records
     )
-    # The completed job is untracked too, without counting as health.
+    # The completed and cancelled jobs are untracked too, without counting.
     assert mgr.batch_api.tracked_jobs == {"5"}
     assert mgr.consecutive_failed_cycles == 0
 
@@ -1542,10 +1569,11 @@ def test_single_failed_job_is_logged_untracked_and_tolerated(
     assert mgr.consecutive_failed_cycles == 1
 
 
-def _check(mgr, failed=None, completed=(), registered=False):
+def _check(mgr, failed=None, completed=(), registered=False, cancelled=None):
     """Run handle_finished_jobs once: clear_failed_jobs returns ``failed``,
-    clear_successful_jobs ``completed``, and with ``registered`` one of the
-    manager's services is registered with the server."""
+    clear_successful_jobs ``completed``, clear_cancelled_jobs ``cancelled``,
+    and with ``registered`` one of the manager's services is registered with
+    the server."""
     server_job_names = (
         {make_job_name(mgr.settings.name)} if registered else {"other.job"}
     )
@@ -1553,8 +1581,32 @@ def _check(mgr, failed=None, completed=(), registered=False):
         mgr.batch_api, "clear_failed_jobs", return_value=dict(failed or {})
     ), patch.object(
         mgr.batch_api, "clear_successful_jobs", return_value=list(completed)
+    ), patch.object(
+        mgr.batch_api, "clear_cancelled_jobs", return_value=dict(cancelled or {})
     ):
         return mgr.handle_finished_jobs(server_job_names)
+
+
+def test_cancelled_jobs_are_logged_but_neither_count_nor_reset(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, caplog
+):
+    """Cancelled jobs are logged at INFO; they neither count toward
+    max_consecutive_failed_cycles nor reset it."""
+    settings = slurm_settings.model_copy(update={"max_consecutive_failed_cycles": 1})
+    mgr = _build_manager(settings, tmp_path)
+    reason = "CANCELLED by 1000, exit code 0, signal 15"
+    with caplog.at_level("INFO", logger="AlchemiscaleComputeManager"):
+        for i in range(5):
+            assert _check(mgr, cancelled={str(i): reason}) == {}
+    assert mgr.consecutive_failed_cycles == 0
+    assert ("INFO", f"Batch job 0 was cancelled: {reason}") in [
+        (r.levelname, r.message) for r in caplog.records
+    ]
+    _check(mgr, {"10": "FAILED"})
+    _check(mgr, cancelled={"11": reason})
+    assert mgr.consecutive_failed_cycles == 1
+    with pytest.raises(JobFailureError):
+        _check(mgr, {"12": "FAILED"}, cancelled={"13": reason})
 
 
 def test_failed_counter_resets_only_on_sign_of_health(
