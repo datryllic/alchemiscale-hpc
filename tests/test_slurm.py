@@ -1,20 +1,25 @@
 """Tests for the SLURM batch API and manager."""
 
 import re
+import subprocess
 import time
 import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
-from alchemiscale.storage.models import ComputeManagerInstruction
+from alchemiscale.storage.models import (
+    ComputeManagerInstruction,
+    ComputeManagerStatus,
+)
 
 from alchemiscale_hpc import (
     HPCBatchApi,
     JobFailureError,
     JobNotFoundError,
+    JobSubmissionError,
 )
 from alchemiscale_hpc.base import is_own_job_name, make_job_name
 from alchemiscale_hpc.slurm import (
@@ -22,7 +27,7 @@ from alchemiscale_hpc.slurm import (
     SlurmManager,
     SlurmManagerSettings,
 )
-from alchemiscale_hpc.slurm.manager import _parse_submit_time
+from alchemiscale_hpc.slurm.manager import _parse_slurm_time
 
 
 @pytest.fixture
@@ -72,7 +77,6 @@ def test_slurm_settings_extends_script_template_base():
     assert {
         "job_script_template",
         "cleanup_successful_jobs",
-        "cleanup_failed_jobs",
         "keep_job_scripts",
         "job_script_dir",
         "job_registration_grace_period",
@@ -232,39 +236,122 @@ def test_parse_jobs_preserves_separators_in_job_name():
 
 
 # ----------------------------------------------------------------------
-# check_job_health
+# clear_failed_jobs: failure reasons from sacct
 # ----------------------------------------------------------------------
 
 
-def test_check_job_health_raises_on_failure(slurm_settings: SlurmManagerSettings):
-    """``_get_failed_jobs`` is already scoped to tracked jobs, so any
-    returned entry is a real failure to surface."""
-    api = SlurmBatchApi(slurm_settings)
-    _track(api, "12345")
-    with patch.object(
-        api,
-        "_get_failed_jobs",
-        return_value=[{"job_id": "12345", "name": "x", "state": "FAILED"}],
-    ):
-        with pytest.raises(JobFailureError, match="12345"):
-            api.check_job_health()
+def test_parse_failed_jobs_builds_reasons():
+    """State, ExitCode (code:signal) and Reason are combined; the job name
+    stays last and may contain the separator."""
+    out = (
+        "1|FAILED|1:0|None|a.b\n"
+        "2|CANCELLED by 1000|0:15|None|c\n"
+        "3|TIMEOUT|0:0|None|d\n"
+        "4|NODE_FAIL|0:0|ReqNodeNotAvail|weird|name\n"
+        "5|OUT_OF_MEMORY|0:125|None|e\n"
+        "garbage\n"
+    )
+    assert [
+        (job["job_id"], job["state"], job["name"], job["reason"])
+        for job in SlurmBatchApi._parse_failed_jobs(out)
+    ] == [
+        ("1", "FAILED", "a.b", "FAILED, exit code 1"),
+        ("2", "CANCELLED by 1000", "c", "CANCELLED by 1000, exit code 0, signal 15"),
+        ("3", "TIMEOUT", "d", "TIMEOUT, exit code 0"),
+        (
+            "4",
+            "NODE_FAIL",
+            "weird|name",
+            "NODE_FAIL, exit code 0, last pending reason ReqNodeNotAvail",
+        ),
+        ("5", "OUT_OF_MEMORY", "e", "OUT_OF_MEMORY, exit code 0, signal 125"),
+    ]
 
 
-def test_check_job_health_silent_when_no_failures(
+def test_clear_failed_jobs_returns_reasons_and_untracks(
     slurm_settings: SlurmManagerSettings,
 ):
+    """Failed jobs come from a ``--jobs=``-scoped sacct query including the
+    exit code and reason; each is returned once, then untracked."""
     api = SlurmBatchApi(slurm_settings)
-    _track(api, "12345")
-    with patch.object(api, "_get_failed_jobs", return_value=[]):
-        api.check_job_health()
+    for jid in ("1", "2", "3"):
+        _track(api, jid)
+    run, calls = _fake_slurm(
+        sacct_tracked=(
+            "1|FAILED|1:0|None|x\n"
+            "2|PREEMPTED|0:0|None|y\n"
+        )
+    )
+    with patch("subprocess.run", side_effect=run):
+        assert api.clear_failed_jobs() == {
+            "1": "FAILED, exit code 1",
+            "2": "PREEMPTED, exit code 0",
+        }
+    assert api.tracked_jobs == {"3"}
+    [cmd] = calls
+    assert "--jobs=1,2,3" in cmd
+    assert "JobID,State,ExitCode,Reason,JobName" in cmd
+    states = set(cmd[cmd.index("-s") + 1].split(","))
+    # Every terminal state other than COMPLETED and CANCELLED, per sacct's
+    # JOB STATE CODES.
+    assert states == {
+        "FAILED",
+        "TIMEOUT",
+        "NODE_FAIL",
+        "PREEMPTED",
+        "OUT_OF_MEMORY",
+        "BOOT_FAIL",
+        "DEADLINE",
+    }
+
+
+def test_cancelled_jobs_are_cleared_separately_from_failed_jobs(
+    slurm_settings: SlurmManagerSettings,
+):
+    """A cancelled job is not returned as failed, but by
+    clear_cancelled_jobs, with its reason, and untracked."""
+    api = SlurmBatchApi(slurm_settings)
+    for jid in ("1", "2"):
+        _track(api, jid)
+    run, calls = _fake_slurm(
+        sacct_tracked=(
+            "1|CANCELLED by 1000|0:15|None|x\n"
+            "2|TIMEOUT|0:0|None|y\n"
+        )
+    )
+    with patch("subprocess.run", side_effect=run):
+        assert api.clear_cancelled_jobs() == {
+            "1": "CANCELLED by 1000, exit code 0, signal 15"
+        }
+        assert api.clear_failed_jobs() == {"2": "TIMEOUT, exit code 0"}
+    assert api.tracked_jobs == set()
+    assert calls[0][calls[0].index("-s") + 1] == "CANCELLED"
+
+
+def test_clear_failed_jobs_ignores_requeued_jobs(
+    slurm_settings: SlurmManagerSettings,
+):
+    """``sacct -s PREEMPTED`` can match a job that was requeued and is
+    pending again; it is still ours to track, not a failure."""
+    api = SlurmBatchApi(slurm_settings)
+    _track(api, "1")
+    run, _ = _fake_slurm(sacct_tracked="1|PENDING|0:0|None|x\n")
+    with patch("subprocess.run", side_effect=run):
+        assert api.clear_failed_jobs() == {}
+    assert api.tracked_jobs == {"1"}
 
 
 # ----------------------------------------------------------------------
-# verify_running_jobs
+# find_unregistered_jobs
 # ----------------------------------------------------------------------
 
 
-def test_verify_running_jobs_recognizes_registered(
+def _running(job_id: str, name: str, started: str = "Unknown") -> dict:
+    """A running job as returned by ``_get_running_jobs``."""
+    return {"job_id": job_id, "name": name, "state": "RUNNING", "started": started}
+
+
+def test_find_unregistered_jobs_recognizes_registered(
     slurm_settings: SlurmManagerSettings,
 ):
     """A tracked SLURM job whose name matches a server-known service passes."""
@@ -272,30 +359,27 @@ def test_verify_running_jobs_recognizes_registered(
     _track(api, "1")
     job_name = f"{slurm_settings.name}.deadbeef"
     with patch.object(
-        api,
-        "_get_running_jobs",
-        return_value=[{"job_id": "1", "name": job_name, "state": "RUNNING"}],
+        api, "_get_running_jobs", return_value=[_running("1", job_name)]
     ):
-        api.verify_running_jobs({job_name})
+        assert api.find_unregistered_jobs({job_name}) == []
 
 
-def test_verify_running_jobs_raises_on_unregistered(
+def test_find_unregistered_jobs_returns_unregistered(
     slurm_settings: SlurmManagerSettings,
 ):
-    """A tracked, past-grace, running job not in server_job_names triggers."""
+    """A tracked, past-grace, running job not in server_job_names is returned."""
     api = SlurmBatchApi(slurm_settings)
     _track(api, "1")
     job_name = f"{slurm_settings.name}.deadbeef"
     with patch.object(
-        api,
-        "_get_running_jobs",
-        return_value=[{"job_id": "1", "name": job_name, "state": "RUNNING"}],
+        api, "_get_running_jobs", return_value=[_running("1", job_name)]
     ):
-        with pytest.raises(JobNotFoundError, match=re.escape(job_name)):
-            api.verify_running_jobs(set())
+        assert api.find_unregistered_jobs(set()) == [
+            {"job_id": "1", "name": job_name, "state": "RUNNING"}
+        ]
 
 
-def test_verify_running_jobs_ignores_untracked_jobs(
+def test_find_unregistered_jobs_ignores_untracked_jobs(
     slurm_settings: SlurmManagerSettings,
 ):
     """Jobs we did not submit are ignored, even if they share our name.
@@ -309,50 +393,43 @@ def test_verify_running_jobs_ignores_untracked_jobs(
     with patch.object(
         api,
         "_get_running_jobs",
-        return_value=[
-            {
-                "job_id": "1",
-                "name": f"{slurm_settings.name}.fromothermanager",
-                "state": "RUNNING",
-            }
-        ],
+        return_value=[_running("1", f"{slurm_settings.name}.fromothermanager")],
     ):
-        api.verify_running_jobs(set())  # should NOT raise
+        assert api.find_unregistered_jobs(set()) == []
 
 
-def test_verify_running_jobs_grace_period_skips_young_jobs(
-    slurm_settings: SlurmManagerSettings,
+def test_find_unregistered_jobs_grace_runs_from_start_time(
+    slurm_settings: SlurmManagerSettings, denver_tz
 ):
-    """Jobs younger than the grace period are skipped, even when unregistered."""
+    """The grace period runs from when the job started running (squeue
+    ``%S``), not from submission: a job that pended for an hour and has just
+    started gets the full grace period."""
     settings = slurm_settings.model_copy(update={"job_registration_grace_period": 600})
     api = SlurmBatchApi(settings)
-    # Track with age=10s; well inside the 600s grace window.
-    _track(api, "1", age_seconds=10)
-    job_name = f"{settings.name}.young"
-    with patch.object(
-        api,
-        "_get_running_jobs",
-        return_value=[{"job_id": "1", "name": job_name, "state": "RUNNING"}],
-    ):
-        # Empty server_job_names; without the grace period this would raise.
-        api.verify_running_jobs(set())
+    _track(api, "1", age_seconds=3600)
+    job_name = f"{settings.name}.old"
+    now = datetime.now(tz=timezone.utc)
+    for started_ago, unregistered in ((10, False), (900, True)):
+        started = _local(now - timedelta(seconds=started_ago))
+        with patch.object(
+            api, "_get_running_jobs", return_value=[_running("1", job_name, started)]
+        ):
+            assert bool(api.find_unregistered_jobs(set())) is unregistered
 
 
-def test_verify_running_jobs_grace_period_expires(
+def test_find_unregistered_jobs_unknown_start_falls_back_to_submit_time(
     slurm_settings: SlurmManagerSettings,
 ):
-    """Past the grace period, the same job DOES raise."""
+    """If squeue's start time does not parse, the submission time is used."""
     settings = slurm_settings.model_copy(update={"job_registration_grace_period": 60})
     api = SlurmBatchApi(settings)
-    _track(api, "1", age_seconds=120)
-    job_name = f"{settings.name}.old"
-    with patch.object(
-        api,
-        "_get_running_jobs",
-        return_value=[{"job_id": "1", "name": job_name, "state": "RUNNING"}],
-    ):
-        with pytest.raises(JobNotFoundError, match="grace period"):
-            api.verify_running_jobs(set())
+    job_name = f"{settings.name}.x"
+    for submitted_ago, unregistered in ((10, False), (120, True)):
+        _track(api, "1", age_seconds=submitted_ago)
+        with patch.object(
+            api, "_get_running_jobs", return_value=[_running("1", job_name, "N/A")]
+        ):
+            assert bool(api.find_unregistered_jobs(set())) is unregistered
 
 
 # ----------------------------------------------------------------------
@@ -406,10 +483,12 @@ def test_clear_failed_jobs_removes_from_set_and_times(
         _track(api, jid)
     with patch.object(
         api,
-        "_get_failed_jobs",
-        return_value=[{"job_id": "1", "name": "x", "state": "FAILED"}],
+        "_get_ended_jobs",
+        return_value=[
+            {"job_id": "1", "name": "x", "state": "FAILED", "reason": "FAILED"}
+        ],
     ):
-        api.clear_failed_jobs()
+        assert api.clear_failed_jobs() == {"1": "FAILED"}
     assert api.tracked_jobs == {"2", "3"}
     assert "1" not in api._submission_times
 
@@ -459,13 +538,28 @@ def test_squeue_tracked_passes_jobs_filter(slurm_settings: SlurmManagerSettings)
     fake = type(
         "R",
         (),
-        {"stdout": "100|RUNNING|x\n", "stderr": "", "returncode": 0},
+        {
+            "stdout": "100|RUNNING|2026-11-18T09:30:00|x\n",
+            "stderr": "",
+            "returncode": 0,
+        },
     )
     with patch("subprocess.run", return_value=fake) as mock_run:
-        api._squeue_tracked("RUNNING")
+        jobs = api._squeue_tracked("RUNNING")
     call_args = mock_run.call_args[0][0]
     assert "--jobs=100,200" in call_args
     assert "--states=RUNNING" in call_args
+    # Start time (``%S``) before the name, as ISO 8601 whatever the user set.
+    assert "%i|%T|%S|%j" in call_args
+    assert mock_run.call_args.kwargs["env"]["SLURM_TIME_FORMAT"] == "standard"
+    assert jobs == [
+        {
+            "job_id": "100",
+            "state": "RUNNING",
+            "started": "2026-11-18T09:30:00",
+            "name": "x",
+        }
+    ]
 
 
 def test_sacct_query_skips_when_no_tracked_jobs(
@@ -474,7 +568,7 @@ def test_sacct_query_skips_when_no_tracked_jobs(
     """No tracked jobs -> no sacct call. Avoids scanning the user's history."""
     api = SlurmBatchApi(slurm_settings)
     with patch("subprocess.run") as mock_run:
-        assert api._sacct_query("COMPLETED", set()) == []
+        assert api._sacct_query("COMPLETED", set(), "JobID") == ""
     mock_run.assert_not_called()
 
 
@@ -486,7 +580,7 @@ def test_sacct_query_uses_jobs_filter_and_parsable_output(
     api = SlurmBatchApi(slurm_settings)
     fake = type("R", (), {"stdout": "", "stderr": "", "returncode": 0})
     with patch("subprocess.run", return_value=fake) as mock_run:
-        api._sacct_query("COMPLETED", {"100", "200"})
+        api._sacct_query("COMPLETED", {"100", "200"}, "JobID")
     call_args = mock_run.call_args[0][0]
     assert "--jobs=100,200" in call_args
     assert "-P" in call_args  # parsable / pipe-separated
@@ -630,6 +724,12 @@ def test_slurm_manager_create_compute_services_cleans_up_scripts(
         return "12345"
 
     with patch.object(
+        mgr.batch_api, "clear_failed_jobs", return_value={}
+    ), patch.object(
+        mgr.batch_api, "find_unregistered_jobs", return_value=[]
+    ), patch.object(
+        mgr.batch_api, "clear_successful_jobs", return_value=[]
+    ), patch.object(
         mgr.batch_api, "jobs_pending", return_value=False
     ), patch.object(mgr.batch_api, "submit_job", side_effect=_fake_submit):
         n = mgr.create_compute_services(
@@ -656,6 +756,12 @@ def test_slurm_manager_keep_job_scripts(
         return "12345"
 
     with patch.object(
+        mgr.batch_api, "clear_failed_jobs", return_value={}
+    ), patch.object(
+        mgr.batch_api, "find_unregistered_jobs", return_value=[]
+    ), patch.object(
+        mgr.batch_api, "clear_successful_jobs", return_value=[]
+    ), patch.object(
         mgr.batch_api, "jobs_pending", return_value=False
     ), patch.object(mgr.batch_api, "submit_job", side_effect=_fake_submit):
         mgr.create_compute_services(
@@ -690,6 +796,12 @@ def test_create_compute_services_honors_target(
         return f"id-{len(submitted)}"
 
     with patch.object(
+        mgr.batch_api, "clear_failed_jobs", return_value={}
+    ), patch.object(
+        mgr.batch_api, "find_unregistered_jobs", return_value=[]
+    ), patch.object(
+        mgr.batch_api, "clear_successful_jobs", return_value=[]
+    ), patch.object(
         mgr.batch_api, "jobs_pending", return_value=False
     ), patch.object(mgr.batch_api, "submit_job", side_effect=_fake_submit):
         n = mgr.create_compute_services(
@@ -706,6 +818,12 @@ def test_create_compute_services_skips_when_pending(
     even when ``target`` says to scale up."""
     mgr = _build_manager(slurm_settings, tmp_path)
     with patch.object(
+        mgr.batch_api, "clear_failed_jobs", return_value={}
+    ), patch.object(
+        mgr.batch_api, "find_unregistered_jobs", return_value=[]
+    ), patch.object(
+        mgr.batch_api, "clear_successful_jobs", return_value=[]
+    ), patch.object(
         mgr.batch_api, "jobs_pending", return_value=True
     ), patch.object(mgr.batch_api, "submit_job") as submit:
         n = mgr.create_compute_services(
@@ -735,10 +853,15 @@ def test_maintain_compute_services_strips_uuid_suffix_correctly(
 
     def _capture(server_job_names):
         captured["names"] = server_job_names
+        return []
 
-    with patch.object(mgr.batch_api, "check_job_health"), patch.object(
-        mgr.batch_api, "verify_running_jobs", side_effect=_capture
-    ), patch.object(mgr.batch_api, "clear_successful_jobs"):
+    with patch.object(
+        mgr.batch_api, "clear_failed_jobs", return_value={}
+    ), patch.object(
+        mgr.batch_api, "find_unregistered_jobs", side_effect=_capture
+    ), patch.object(
+        mgr.batch_api, "clear_successful_jobs", return_value=[]
+    ):
         mgr.maintain_compute_services(
             {"compute_service_ids": [service_id], "num_tasks": 0}
         )
@@ -753,12 +876,10 @@ def test_create_compute_services_does_not_run_maintenance(
     ``maintain_compute_services``."""
     mgr = _build_manager(slurm_settings, tmp_path)
     with patch.object(mgr, "maintain_compute_services") as maintain, patch.object(
-        mgr.batch_api, "check_job_health"
-    ) as health, patch.object(
-        mgr.batch_api, "verify_running_jobs"
-    ) as verify, patch.object(
-        mgr.batch_api, "clear_successful_jobs"
-    ) as clear, patch.object(
+        mgr, "handle_finished_jobs"
+    ) as finished, patch.object(
+        mgr, "handle_unregistered_jobs"
+    ) as unregistered, patch.object(
         mgr.batch_api, "jobs_pending", return_value=False
     ), patch.object(
         mgr.batch_api, "submit_job", return_value="1"
@@ -767,9 +888,8 @@ def test_create_compute_services_does_not_run_maintenance(
             {"compute_service_ids": [], "num_tasks": 1}, target=1
         )
     maintain.assert_not_called()
-    health.assert_not_called()
-    verify.assert_not_called()
-    clear.assert_not_called()
+    finished.assert_not_called()
+    unregistered.assert_not_called()
 
 
 # ----------------------------------------------------------------------
@@ -790,18 +910,15 @@ def test_cycle_runs_maintenance_with_no_tasks(
         {"compute_service_ids": [service_id], "num_tasks": 0},
     )
 
-    with patch.object(mgr.batch_api, "check_job_health") as health, patch.object(
-        mgr.batch_api, "verify_running_jobs"
-    ) as verify, patch.object(
-        mgr.batch_api, "clear_successful_jobs"
-    ) as clear, patch.object(
+    with patch.object(mgr, "handle_finished_jobs") as finished, patch.object(
+        mgr, "handle_unregistered_jobs"
+    ) as unregistered, patch.object(
         mgr, "create_compute_services"
     ) as create:
         assert mgr.cycle() is True
 
-    health.assert_called_once_with()
-    verify.assert_called_once_with({service_name})
-    clear.assert_called_once_with()
+    finished.assert_called_once_with({service_name})
+    unregistered.assert_called_once_with({service_name})
     create.assert_not_called()
     mgr.client.update_status.assert_called_once()
 
@@ -862,20 +979,22 @@ def test_cycle_scale_up_runs_each_primitive_once(
         {"compute_service_ids": [], "num_tasks": 1},
     )
 
-    with patch.object(mgr.batch_api, "check_job_health") as health, patch.object(
-        mgr.batch_api, "verify_running_jobs"
-    ) as verify, patch.object(
-        mgr.batch_api, "clear_successful_jobs"
-    ) as clear, patch.object(
+    with patch.object(
+        mgr.batch_api, "clear_failed_jobs", return_value={}
+    ) as failed, patch.object(
+        mgr.batch_api, "find_unregistered_jobs", return_value=[]
+    ) as unregistered, patch.object(
+        mgr.batch_api, "clear_successful_jobs", return_value=[]
+    ) as completed, patch.object(
         mgr.batch_api, "jobs_pending", return_value=False
     ), patch.object(
         mgr.batch_api, "submit_job", return_value="1"
     ) as submit:
         assert mgr.cycle() is True
 
-    health.assert_called_once_with()
-    verify.assert_called_once_with(set())
-    clear.assert_called_once_with()
+    failed.assert_called_once_with()
+    unregistered.assert_called_once_with(set())
+    completed.assert_called_once_with()
     submit.assert_called_once()
 
 
@@ -948,8 +1067,8 @@ def test_cycle_skips_maintenance_on_shutdown(
 def test_cycle_propagates_maintenance_errors(
     slurm_settings: SlurmManagerSettings, tmp_path: Path
 ):
-    """A failing health check aborts the cycle before sizing or submission,
-    and the client's ``get_instruction`` is restored afterwards."""
+    """A failing finished-job check aborts the cycle before sizing or
+    submission, and the client's ``get_instruction`` is restored afterwards."""
     mgr = _build_manager(slurm_settings, tmp_path)
     get_instruction = mgr.client.get_instruction
     get_instruction.return_value = (
@@ -958,7 +1077,7 @@ def test_cycle_propagates_maintenance_errors(
     )
 
     with patch.object(
-        mgr.batch_api, "check_job_health", side_effect=JobFailureError("boom")
+        mgr, "handle_finished_jobs", side_effect=JobFailureError("boom")
     ), patch.object(mgr, "create_compute_services") as create:
         with pytest.raises(JobFailureError, match="boom"):
             mgr.cycle()
@@ -1001,13 +1120,15 @@ def _fake_slurm(
     sacct_user: str = "",
     tracked: dict = None,
     sacct_tracked: str = "",
+    sacct_completed: str = "",
 ):
     """Fake ``subprocess.run`` for squeue/sacct.
 
     ``squeue_user``/``sacct_user`` answer user-scoped queries (recovery);
     ``tracked`` maps a ``--states=`` value to the answer for ``--jobs=``-scoped
     squeue queries, and ``sacct_tracked`` answers ``--jobs=``-scoped sacct
-    queries (the manager loop). Every call is recorded in ``calls``.
+    queries for failed jobs (the manager loop), ``sacct_completed`` those
+    for completed jobs. Every call is recorded in ``calls``.
     """
     calls = []
 
@@ -1020,6 +1141,8 @@ def _fake_slurm(
             return _Result((tracked or {}).get(state.split("=", 1)[1], ""))
         if cmd[0] == "sacct" and "-u" in cmd:
             return _Result(sacct_user)
+        if cmd[0] == "sacct" and cmd[cmd.index("-s") + 1] == "COMPLETED":
+            return _Result(sacct_completed)
         if cmd[0] == "sacct":
             return _Result(sacct_tracked)
         return _Result()
@@ -1236,8 +1359,8 @@ def test_jobs_submitted_before_restart_are_recovered(
             f"102|RUNNING|{long_ago}|{running}\n"
         ),
         tracked={
-            "PENDING": f"101|PENDING|{pending}\n",
-            "RUNNING": f"102|RUNNING|{running}\n",
+            "PENDING": f"101|PENDING|N/A|{pending}\n",
+            "RUNNING": f"102|RUNNING|{long_ago}|{running}\n",
         },
     )
     after = SlurmBatchApi(slurm_settings)
@@ -1246,59 +1369,144 @@ def test_jobs_submitted_before_restart_are_recovered(
         after.recover_jobs()
         assert after.tracked_jobs == before.tracked_jobs
         assert after.jobs_pending() is True
-        after.verify_running_jobs({running})
-        with pytest.raises(JobNotFoundError, match=running):
-            after.verify_running_jobs(set())
+        assert after.find_unregistered_jobs({running}) == []
+        [job] = after.find_unregistered_jobs(set())
+        assert job["name"] == running
 
 
-def test_recovered_job_grace_period_runs_from_submit_time(
+def test_recovered_job_grace_period_runs_from_start_time(
     slurm_settings: SlurmManagerSettings, whoami, denver_tz
 ):
-    """The grace period runs from SLURM's submit time, not from recovery."""
+    """A recovered job's grace period runs from SLURM's start time, not from
+    recovery or submission: a job submitted an hour ago that started 30s ago
+    is still in its grace period."""
     settings = slurm_settings.model_copy(update={"job_registration_grace_period": 600})
     job_name = make_job_name(settings.name)
     now = datetime.now(tz=timezone.utc)
-    for age, raises in ((30, False), (900, True)):
+    submitted = _local(now - timedelta(hours=1))
+    for started_ago, unregistered in ((30, False), (900, True)):
+        started = _local(now - timedelta(seconds=started_ago))
         run, _ = _fake_slurm(
-            squeue_user=(
-                f"101|RUNNING|{_local(now - timedelta(seconds=age))}|{job_name}\n"
-            ),
-            tracked={"RUNNING": f"101|RUNNING|{job_name}\n"},
+            squeue_user=f"101|RUNNING|{submitted}|{job_name}\n",
+            tracked={"RUNNING": f"101|RUNNING|{started}|{job_name}\n"},
         )
         api = SlurmBatchApi(settings)
         with patch("subprocess.run", side_effect=run):
             api.recover_jobs()
-            if raises:
-                with pytest.raises(JobNotFoundError):
-                    api.verify_running_jobs(set())
-            else:
-                api.verify_running_jobs(set())
+            assert bool(api.find_unregistered_jobs(set())) is unregistered
 
 
-def test_parse_submit_time(denver_tz):
+def test_parse_slurm_time(denver_tz):
     """SLURM prints local time; America/Denver is UTC-7 in November."""
-    assert _parse_submit_time("2026-11-18T09:30:00") == datetime(
+    assert _parse_slurm_time("2026-11-18T09:30:00") == datetime(
         2026, 11, 18, 16, 30, tzinfo=timezone.utc
     )
-    assert _parse_submit_time("Unknown") is None
-    assert _parse_submit_time("N/A") is None
+    assert _parse_slurm_time("Unknown") is None
+    assert _parse_slurm_time("N/A") is None
 
 
 def test_manager_start_recovers_jobs_before_first_cycle(
     slurm_settings: SlurmManagerSettings, tmp_path: Path
 ):
+    """Queued jobs are recovered first; recently finished jobs separately,
+    then their failures are cleared, all before the main loop."""
     mgr = _build_manager(slurm_settings, tmp_path)
     order = []
     with patch.object(
         mgr.batch_api,
         "recover_jobs",
-        side_effect=lambda: order.append("recover") or [],
+        side_effect=lambda **kwargs: order.append(("recover", kwargs)) or [],
+    ), patch.object(
+        mgr.batch_api,
+        "clear_failed_jobs",
+        side_effect=lambda: order.append("clear_failed") or {},
     ), patch(
         "alchemiscale.compute.manager.ComputeManager.start",
         side_effect=lambda **kwargs: order.append("start"),
     ):
         mgr.start(max_cycles=1)
-    assert order == ["recover", "start"]
+    assert order == [
+        ("recover", {}),
+        ("recover", {"include_finished": True}),
+        "clear_failed",
+        "start",
+    ]
+
+
+def test_manager_start_logs_failures_without_counting_them(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, whoami, caplog
+):
+    """Jobs that failed while the manager was down are summarized at WARNING
+    and listed with their reasons at INFO, untracked, and not counted toward
+    max_consecutive_failed_cycles, even with a limit of 0. Jobs that completed
+    or were cancelled before startup are untracked as well, unreported."""
+    settings = slurm_settings.model_copy(update={"max_consecutive_failed_cycles": 0})
+    mgr = _build_manager(settings, tmp_path)
+    name = settings.name
+    ts = "2026-11-18T09:30:00"
+    run, _ = _fake_slurm(
+        squeue_user=f"5|RUNNING|{ts}|{make_job_name(name)}\n",
+        sacct_user=(
+            f"7|TIMEOUT|{ts}|{make_job_name(name)}\n"
+            f"8|COMPLETED|{ts}|{make_job_name(name)}\n"
+            f"9|CANCELLED by 1000|{ts}|{make_job_name(name)}\n"
+        ),
+        sacct_tracked=(
+            "7|TIMEOUT|0:0|None|x\n"
+            "9|CANCELLED by 1000|0:15|None|x\n"
+        ),
+    )
+    with patch("subprocess.run", side_effect=run), patch(
+        "alchemiscale.compute.manager.ComputeManager.start"
+    ) as start:
+        with caplog.at_level("INFO", logger="AlchemiscaleComputeManager"):
+            mgr.start()
+    start.assert_called_once()
+    assert "Recovered 1 queued job(s) from the batch system (1 RUNNING)" in (
+        caplog.text
+    )
+    records = [(r.levelname, r.message) for r in caplog.records]
+    assert (
+        "WARNING",
+        "1 job(s) of this manager failed recently, before startup; not counted "
+        "toward max_consecutive_failed_cycles",
+    ) in records
+    assert ("INFO", "Batch job 7 failed before startup: TIMEOUT, exit code 0") in (
+        records
+    )
+    # The completed and cancelled jobs are untracked too, without counting.
+    assert mgr.batch_api.tracked_jobs == {"5"}
+    assert mgr.consecutive_failed_cycles == 0
+
+
+def test_manager_starts_when_accounting_is_unavailable(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, whoami, caplog
+):
+    """Reporting earlier failures is best effort: if sacct fails (accounting
+    disabled, slurmdbd down), the manager logs a warning and starts, with its
+    queued jobs recovered from squeue."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    job_name = make_job_name(slurm_settings.name)
+
+    def run(cmd, **kwargs):
+        if cmd[0] == "sacct":
+            return _Result(
+                stderr="sacct: error: Slurm accounting storage is disabled\n",
+                returncode=1,
+            )
+        return _Result(f"5|RUNNING|2026-11-18T09:30:00|{job_name}\n")
+
+    with patch("subprocess.run", side_effect=run), patch(
+        "alchemiscale_hpc.slurm.manager.time.sleep"
+    ), patch("alchemiscale.compute.manager.ComputeManager.start") as start:
+        with caplog.at_level("WARNING", logger="AlchemiscaleComputeManager"):
+            mgr.start()
+    start.assert_called_once()
+    assert mgr.batch_api.tracked_jobs == {"5"}
+    [record] = caplog.records
+    assert record.levelname == "WARNING"
+    assert "failures from before startup are not reported" in record.message
+    assert "accounting storage is disabled" in record.message
 
 
 def test_manager_start_fails_if_recovery_fails(
@@ -1315,6 +1523,558 @@ def test_manager_start_fails_if_recovery_fails(
                 mgr.start()
     start.assert_not_called()
     assert "Failed to recover jobs from the batch system: squeue down" in caplog.text
+
+
+# ----------------------------------------------------------------------
+# handle_finished_jobs: log and untrack, stop only on repeated failures
+# ----------------------------------------------------------------------
+
+
+def test_settings_max_consecutive_failed_cycles(tmp_path: Path):
+    """Default 5, null allowed (never stop), negative rejected."""
+    settings = SlurmManagerSettings(**_settings_kwargs(tmp_path))
+    assert settings.max_consecutive_failed_cycles == 5
+    settings = SlurmManagerSettings(
+        **_settings_kwargs(tmp_path, max_consecutive_failed_cycles=None)
+    )
+    assert settings.max_consecutive_failed_cycles is None
+    with pytest.raises(ValueError):
+        SlurmManagerSettings(
+            **_settings_kwargs(tmp_path, max_consecutive_failed_cycles=-1)
+        )
+
+
+def test_single_failed_job_is_logged_untracked_and_tolerated(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, caplog
+):
+    """One failed job is logged at ERROR with its reason and untracked; the
+    manager carries on and submits."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    _track(mgr.batch_api, "7")
+    _track(mgr.batch_api, "8")
+    run, _ = _fake_slurm(sacct_tracked="7|NODE_FAIL|0:0|None|x\n")
+    with patch("subprocess.run", side_effect=run), patch.object(
+        mgr.batch_api, "submit_job", return_value="9"
+    ) as submit:
+        data = {"compute_service_ids": [], "num_tasks": 1}
+        with caplog.at_level("ERROR", logger="AlchemiscaleComputeManager"):
+            mgr.maintain_compute_services(data)
+            n = mgr.create_compute_services(data, target=1)
+    assert n == 1
+    submit.assert_called_once()
+    [record] = [r for r in caplog.records if "failed" in r.message]
+    assert record.levelname == "ERROR"
+    assert record.message == "Batch job 7 failed: NODE_FAIL, exit code 0"
+    assert mgr.batch_api.tracked_jobs == {"8"}
+    assert mgr.consecutive_failed_cycles == 1
+
+
+def _check(mgr, failed=None, completed=(), registered=False, cancelled=None):
+    """Run handle_finished_jobs once: clear_failed_jobs returns ``failed``,
+    clear_successful_jobs ``completed``, clear_cancelled_jobs ``cancelled``,
+    and with ``registered`` one of the manager's services is registered with
+    the server."""
+    server_job_names = (
+        {make_job_name(mgr.settings.name)} if registered else {"other.job"}
+    )
+    with patch.object(
+        mgr.batch_api, "clear_failed_jobs", return_value=dict(failed or {})
+    ), patch.object(
+        mgr.batch_api, "clear_successful_jobs", return_value=list(completed)
+    ), patch.object(
+        mgr.batch_api, "clear_cancelled_jobs", return_value=dict(cancelled or {})
+    ):
+        return mgr.handle_finished_jobs(server_job_names)
+
+
+def test_cancelled_jobs_are_logged_but_neither_count_nor_reset(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, caplog
+):
+    """Cancelled jobs are logged at INFO; they neither count toward
+    max_consecutive_failed_cycles nor reset it."""
+    settings = slurm_settings.model_copy(update={"max_consecutive_failed_cycles": 1})
+    mgr = _build_manager(settings, tmp_path)
+    reason = "CANCELLED by 1000, exit code 0, signal 15"
+    with caplog.at_level("INFO", logger="AlchemiscaleComputeManager"):
+        for i in range(5):
+            assert _check(mgr, cancelled={str(i): reason}) == {}
+    assert mgr.consecutive_failed_cycles == 0
+    assert ("INFO", f"Batch job 0 was cancelled: {reason}") in [
+        (r.levelname, r.message) for r in caplog.records
+    ]
+    _check(mgr, {"10": "FAILED"})
+    _check(mgr, cancelled={"11": reason})
+    assert mgr.consecutive_failed_cycles == 1
+    with pytest.raises(JobFailureError):
+        _check(mgr, {"12": "FAILED"}, cancelled={"13": reason})
+
+
+def test_failed_counter_resets_only_on_sign_of_health(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """Checks with failures increment; checks with neither failures nor a
+    sign of health (e.g. only pending jobs) leave the count; a completed job
+    or a registered service resets it."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    for i in range(3):
+        _check(mgr, {str(i): "FAILED"})
+    assert mgr.consecutive_failed_cycles == 3
+    _check(mgr)
+    assert mgr.consecutive_failed_cycles == 3
+    _check(mgr, completed=["9"])
+    assert mgr.consecutive_failed_cycles == 0
+    _check(mgr, {"4": "FAILED"})
+    _check(mgr, registered=True)
+    assert mgr.consecutive_failed_cycles == 0
+
+
+def test_other_managers_services_are_not_a_sign_of_health(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """Only this manager's registered services count: not those of manager
+    ``testmgr.bar``, whose job names extend ours."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    with patch.object(
+        mgr.batch_api, "clear_failed_jobs", return_value={"1": "FAILED"}
+    ), patch.object(mgr.batch_api, "clear_successful_jobs", return_value=[]):
+        mgr.handle_finished_jobs({make_job_name(f"{mgr.settings.name}.bar")})
+    assert mgr.consecutive_failed_cycles == 1
+
+
+def test_healthy_fleet_with_sporadic_failures_never_stops(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """In a large fleet, some job is preempted or times out on most checks;
+    with services registered, that never stops the manager."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    for i in range(200):
+        _check(mgr, {str(i): "PREEMPTED"}, registered=True)
+    assert mgr.consecutive_failed_cycles == 0
+
+
+def _simulate_broken_template(mgr, pend, cycles=100):
+    """Every job pends ``pend`` cycles, then fails without registering.
+    Returns the cycle at which the manager stopped, or None."""
+    jobs = {}  # job ID -> cycle submitted
+    state = {"cycle": 0}
+
+    def failed(jid):
+        return state["cycle"] - jobs[jid] > pend
+
+    def clear_failed():
+        out = {jid: "FAILED, exit code 1" for jid in jobs if failed(jid)}
+        for jid in out:
+            del jobs[jid]
+        return out
+
+    def submit(path):
+        jid = str(len(jobs) + 1000 * state["cycle"])
+        jobs[jid] = state["cycle"]
+        return jid
+
+    api = mgr.batch_api
+    with patch.object(api, "clear_failed_jobs", side_effect=clear_failed), patch.object(
+        api, "clear_successful_jobs", return_value=[]
+    ), patch.object(api, "find_unregistered_jobs", return_value=[]), patch.object(
+        api, "jobs_pending", side_effect=lambda: any(not failed(j) for j in jobs)
+    ), patch.object(
+        api, "submit_job", side_effect=submit
+    ):
+        for cycle in range(cycles):
+            state["cycle"] = cycle
+            data = {"compute_service_ids": [], "num_tasks": 10}
+            try:
+                mgr.maintain_compute_services(data)
+                mgr.create_compute_services(data, target=2)
+            except JobFailureError:
+                return cycle
+    return None
+
+
+@pytest.mark.parametrize("pend", [0, 1, 2, 5])
+def test_broken_template_stops_even_when_jobs_pend(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, pend: int
+):
+    """Checks that only see pending jobs do not reset the count, so jobs that
+    pend before failing still stop the manager, on the 6th failing check."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    assert _simulate_broken_template(mgr, pend) == 6 * (pend + 1)
+
+
+def test_failed_cycles_raise_after_default_limit(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """With the default limit of 5, the 6th failing check without a sign of
+    health raises, naming the jobs and pointing at the template and
+    settings."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    for i in range(5):
+        _check(mgr, {str(i): "FAILED"})
+    with pytest.raises(
+        JobFailureError,
+        match=r"6 checks with no job completing or registering in between, "
+        r"exceeding max_consecutive_failed_cycles=5; most recent: 5, 6\. "
+        r"Check the job script template",
+    ):
+        _check(mgr, {"5": "FAILED", "6": "TIMEOUT"})
+
+
+def test_failed_cycles_limit_zero_stops_on_first_failure(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    mgr = _build_manager(
+        slurm_settings.model_copy(update={"max_consecutive_failed_cycles": 0}),
+        tmp_path,
+    )
+    _check(mgr)
+    with pytest.raises(JobFailureError):
+        _check(mgr, {"1": "FAILED"})
+
+
+def test_failed_cycles_limit_none_never_stops(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    mgr = _build_manager(
+        slurm_settings.model_copy(update={"max_consecutive_failed_cycles": None}),
+        tmp_path,
+    )
+    for i in range(50):
+        _check(mgr, {str(i): "FAILED"})
+    assert mgr.consecutive_failed_cycles == 50
+
+
+# ----------------------------------------------------------------------
+# handle_unregistered_jobs: tolerate briefly unregistered running jobs
+# ----------------------------------------------------------------------
+
+
+def _check_unregistered(mgr, job_name, checks):
+    """Run handle_unregistered_jobs ``checks`` times with job 1 unregistered."""
+    job = {"job_id": "1", "name": job_name, "state": "RUNNING"}
+    with patch.object(mgr.batch_api, "find_unregistered_jobs", return_value=[job]):
+        for _ in range(checks):
+            mgr.handle_unregistered_jobs(set())
+
+
+def test_unregistered_job_is_tolerated_then_raises(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, caplog
+):
+    """With grace 0, the first check warns and the second raises, as with
+    alchemiscale-k8s's watchlist."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    job_name = make_job_name(slurm_settings.name)
+    with caplog.at_level("WARNING", logger="AlchemiscaleComputeManager"):
+        _check_unregistered(mgr, job_name, 1)
+    [record] = caplog.records
+    assert record.levelname == "WARNING"
+    assert f"Job {job_name} (batch ID: 1) is running but not registered" in (
+        record.message
+    )
+    with pytest.raises(
+        JobNotFoundError,
+        match=re.escape(job_name) + r".*2 consecutive checks.*--name",
+    ):
+        _check_unregistered(mgr, job_name, 1)
+
+
+def test_unregistered_job_must_stay_unregistered_for_grace_period(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """With short cycles, a job is tolerated until it has been found
+    unregistered for at least the grace period, covering e.g. a slow epilog
+    after its service deregistered."""
+    mgr = _build_manager(
+        slurm_settings.model_copy(update={"job_registration_grace_period": 120}),
+        tmp_path,
+    )
+    job_name = make_job_name(slurm_settings.name)
+    _check_unregistered(mgr, job_name, 5)
+    # Back-date when the job was first found unregistered.
+    first_found, checks = mgr._unregistered_jobs["1"]
+    mgr._unregistered_jobs["1"] = (first_found - timedelta(seconds=121), checks)
+    with pytest.raises(JobNotFoundError, match="6 consecutive checks"):
+        _check_unregistered(mgr, job_name, 1)
+
+
+def test_unregistered_job_is_forgotten_once_registered_or_gone(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """A check that does not find the job unregistered forgets it."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    job_name = make_job_name(slurm_settings.name)
+    _check_unregistered(mgr, job_name, 1)
+    with patch.object(mgr.batch_api, "find_unregistered_jobs", return_value=[]):
+        mgr.handle_unregistered_jobs({job_name})
+    assert mgr._unregistered_jobs == {}
+    _check_unregistered(mgr, job_name, 1)  # a first check again: no raise
+
+
+def test_unregistered_running_job_end_to_end(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path, denver_tz
+):
+    """Through squeue: a job that pended for an hour and just started is in
+    its grace period; once past it, it is tolerated once, then raises."""
+    settings = slurm_settings.model_copy(update={"job_registration_grace_period": 120})
+    mgr = _build_manager(settings, tmp_path)
+    job_name = make_job_name(settings.name)
+    _track(mgr.batch_api, "1", age_seconds=3600)
+    now = datetime.now(tz=timezone.utc)
+
+    def check(started_ago):
+        started = _local(now - timedelta(seconds=started_ago))
+        run, _ = _fake_slurm(tracked={"RUNNING": f"1|RUNNING|{started}|{job_name}\n"})
+        with patch("subprocess.run", side_effect=run):
+            mgr.handle_unregistered_jobs(set())
+
+    check(10)
+    assert mgr._unregistered_jobs == {}
+    check(200)
+    assert mgr._unregistered_jobs["1"][1] == 1
+    # The next check comes one (150s) cycle later.
+    mgr._unregistered_jobs["1"] = (now - timedelta(seconds=150), 1)
+    with pytest.raises(JobNotFoundError):
+        check(350)
+
+
+# ----------------------------------------------------------------------
+# Submission failures
+# ----------------------------------------------------------------------
+
+
+def _submit_cycles(mgr, outcomes, pending=False, registered=False):
+    """Run one create_compute_services cycle per entry of ``outcomes``, each
+    a list of submit_job results (an exception or a job ID), one per job the
+    cycle tries to submit. With ``registered``, one of the manager's
+    services is registered with the server."""
+    results = [r for outcome in outcomes for r in outcome]
+    service_ids = (
+        [f"{make_job_name(mgr.settings.name)}-{uuid4().hex}"] if registered else []
+    )
+    with patch.object(
+        mgr.batch_api, "clear_failed_jobs", return_value={}
+    ), patch.object(
+        mgr.batch_api, "find_unregistered_jobs", return_value=[]
+    ), patch.object(
+        mgr.batch_api, "clear_successful_jobs", return_value=[]
+    ), patch.object(
+        mgr.batch_api, "jobs_pending", return_value=pending
+    ), patch.object(
+        mgr.batch_api, "submit_job", side_effect=results
+    ):
+        for outcome in outcomes:
+            mgr.create_compute_services(
+                {"compute_service_ids": service_ids, "num_tasks": 10},
+                target=max(len(outcome), 1),
+            )
+
+
+def test_submission_failures_counted_and_reset(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """Cycles in which every submission fails are counted; a cycle with any
+    successful submission resets the count."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    fail = RuntimeError("sbatch: error: invalid partition specified")
+    _submit_cycles(mgr, [[fail], [fail]])
+    assert mgr.consecutive_failed_submission_cycles == 2
+    # The first submission succeeds and the second fails: a reset.
+    _submit_cycles(mgr, [["1", fail]])
+    assert mgr.consecutive_failed_submission_cycles == 0
+
+
+def test_submission_failures_raise_after_limit(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    mgr = _build_manager(slurm_settings, tmp_path)
+    fail = RuntimeError("sbatch: error: invalid partition specified")
+    _submit_cycles(mgr, [[fail]] * 5)
+    with pytest.raises(
+        JobSubmissionError,
+        match=r"failed in 6 cycles with no compute service of this manager "
+        r"registered, exceeding max_consecutive_failed_cycles=5; most recent "
+        r"error: sbatch: error: invalid partition specified\. Check the job "
+        r"script template",
+    ) as excinfo:
+        _submit_cycles(mgr, [[fail]])
+    assert excinfo.value.__cause__ is fail
+
+
+def _run_against_fake_slurm(mgr, sbatch_error=None, max_cycles=100):
+    """Run ``mgr.start()`` against a fake SLURM in which each job pends for
+    one cycle and then fails, or ``sbatch`` fails with ``sbatch_error``.
+    The server never sees a compute service. Returns the number of cycles
+    completed (the one that raised is not) and the exception ``start()``
+    raised."""
+    jobs = {}  # job ID -> state
+    cycles = [0]
+
+    def run(cmd, **kwargs):
+        if cmd[0] == "sbatch":
+            if sbatch_error:
+                raise subprocess.CalledProcessError(1, cmd, "", sbatch_error)
+            job_id = str(100 + len(jobs))
+            jobs[job_id] = "PENDING"
+            return _Result(f"Submitted batch job {job_id}\n")
+        if "-u" in cmd:  # recovery: nothing from before startup
+            return _Result()
+        ids = next(a for a in cmd if a.startswith("--jobs=")).split("=")[1]
+        ids = [i for i in ids.split(",") if i in jobs]
+        if cmd[0] == "squeue":
+            state = next(a for a in cmd if a.startswith("--states=")).split("=")[1]
+            return _Result(
+                "".join(f"{i}|{state}|Unknown|x\n" for i in ids if jobs[i] == state)
+            )
+        states = cmd[cmd.index("-s") + 1].split(",")
+        return _Result(
+            "".join(
+                f"{i}|{jobs[i]}|1:0|None|x\n" for i in ids if jobs[i] in states
+            )
+        )
+
+    def sleep(seconds):
+        cycles[0] += 1
+        for job_id in jobs:
+            jobs[job_id] = "FAILED"
+
+    mgr.client.get_instruction.return_value = (
+        ComputeManagerInstruction.OK,
+        {"compute_service_ids": [], "num_tasks": 10},
+    )
+    mgr.int_sleep = MagicMock(side_effect=sleep)
+    with patch("subprocess.run", side_effect=run), patch(
+        "alchemiscale_hpc.slurm.manager._whoami", return_value="alice"
+    ), patch("alchemiscale_hpc.slurm.manager.time.sleep"):
+        with pytest.raises(Exception) as excinfo:
+            mgr.start(max_cycles=max_cycles)
+    return cycles[0], excinfo.value
+
+
+@pytest.mark.parametrize(
+    "sbatch_error, error, completed",
+    [
+        # Jobs submitted in cycle 1 fail in cycle 2, and so on; the 6th
+        # failing check, in cycle 7, raises.
+        (None, JobFailureError, 6),
+        # Every cycle submits and fails; the 6th raises.
+        (
+            "sbatch: error: invalid partition specified: x",
+            JobSubmissionError,
+            5,
+        ),
+    ],
+)
+def test_manager_stops_and_deregisters_on_repeated_failures(
+    slurm_settings: SlurmManagerSettings,
+    tmp_path: Path,
+    sbatch_error,
+    error,
+    completed,
+):
+    """Through ``start()``, a broken template or broken settings stop the
+    manager after the default limit, setting ERROR and deregistering."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    ran, raised = _run_against_fake_slurm(mgr, sbatch_error)
+    assert isinstance(raised, error)
+    assert ran == completed
+    if sbatch_error:
+        assert sbatch_error in str(raised)
+    assert mgr.client.update_status.call_args.args[1] == ComputeManagerStatus.ERROR
+    mgr.client.deregister.assert_called_once()
+
+
+def test_submission_failures_limit_zero_and_none(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    fail = RuntimeError("boom")
+    mgr = _build_manager(
+        slurm_settings.model_copy(update={"max_consecutive_failed_cycles": 0}),
+        tmp_path,
+    )
+    with pytest.raises(JobSubmissionError):
+        _submit_cycles(mgr, [[fail]])
+
+    mgr = _build_manager(
+        slurm_settings.model_copy(update={"max_consecutive_failed_cycles": None}),
+        tmp_path,
+    )
+    _submit_cycles(mgr, [[fail]] * 20)
+    assert mgr.consecutive_failed_submission_cycles == 20
+
+
+def test_submission_failures_not_counted_while_service_registered(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """At a submit limit (e.g. MaxSubmitJobsPerUser), every sbatch fails
+    while the fleet runs; that does not stop a healthy manager."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    limit = RuntimeError(
+        "sbatch exited with code 1: sbatch: error: QOSMaxSubmitJobPerUserLimit"
+    )
+    _submit_cycles(mgr, [[limit]])
+    _submit_cycles(mgr, [[limit]] * 50, registered=True)
+    assert mgr.consecutive_failed_submission_cycles == 1
+
+
+def test_cycle_without_submission_leaves_submission_count(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """A cycle that skips submission because jobs are pending neither counts
+    as a failure nor resets the count."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    _submit_cycles(mgr, [[RuntimeError("boom")]])
+    _submit_cycles(mgr, [[]], pending=True)
+    assert mgr.consecutive_failed_submission_cycles == 1
+
+
+def test_job_script_write_failure_counts_as_failed_submission(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """Failing to write the job script (e.g. an unwritable job_script_dir) is
+    a failed submission, not an immediate halt."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    with patch.object(
+        mgr, "_create_job_script", side_effect=PermissionError("Permission denied")
+    ):
+        _submit_cycles(mgr, [[]])
+    assert mgr.consecutive_failed_submission_cycles == 1
+
+
+def test_job_script_rendering_error_propagates(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """Other errors while creating the script are bugs (e.g. a template
+    placeholder mismatch), so they propagate rather than being counted."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    with patch.object(
+        mgr, "_create_job_script", side_effect=ValueError("unknown placeholder")
+    ):
+        with pytest.raises(ValueError, match="unknown placeholder"):
+            _submit_cycles(mgr, [[]])
+    assert mgr.consecutive_failed_submission_cycles == 0
+
+
+def test_submit_job_error_includes_sbatch_stderr(
+    slurm_settings: SlurmManagerSettings, tmp_path: Path
+):
+    """sbatch's stderr says why it failed; it reaches the error message."""
+    api = SlurmBatchApi(slurm_settings)
+    script = tmp_path / "script.sh"
+    script.write_text("#!/bin/bash\n")
+    error = subprocess.CalledProcessError(
+        1,
+        ["sbatch", str(script)],
+        output="",
+        stderr="sbatch: error: invalid partition specified: nope\n",
+    )
+    with patch("subprocess.run", side_effect=error):
+        with pytest.raises(
+            RuntimeError,
+            match=r"^sbatch exited with code 1: sbatch: error: invalid "
+            r"partition specified: nope$",
+        ) as excinfo:
+            api.submit_job(script)
+    assert excinfo.value.__cause__ is error
+    assert api.tracked_jobs == set()
 
 
 # Job script template validation

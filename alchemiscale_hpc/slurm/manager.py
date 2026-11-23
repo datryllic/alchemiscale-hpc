@@ -11,15 +11,19 @@ from typing import ClassVar, Dict, FrozenSet, Iterable, List, Optional, Set
 from ..base import (
     _TEMPLATE_TOKEN,
     HPCBatchApi,
-    JobFailureError,
-    JobNotFoundError,
     ScriptTemplateHPCManager,
     is_own_job_name,
 )
 from .settings import SlurmManagerSettings
 
-# SLURM job states considered "failed" for health-check purposes.
-SLURM_FAILED_STATES = "FAILED,TIMEOUT,CANCELLED,NODE_FAIL,PREEMPTED"
+# SLURM job states considered "failed": every terminal state in sacct's JOB
+# STATE CODES other than COMPLETED and CANCELLED. A cancelled job was stopped
+# by someone (``scancel``), so says nothing about the job script or settings;
+# see ``clear_cancelled_jobs``. sacct prints its state as ``CANCELLED by <uid>``.
+SLURM_FAILED_STATES = (
+    "FAILED,TIMEOUT,NODE_FAIL,PREEMPTED,OUT_OF_MEMORY,BOOT_FAIL,DEADLINE"
+)
+SLURM_CANCELLED_STATE = "CANCELLED"
 
 # Field separator for ``squeue``/``sacct`` parsable output. ``%j`` (job name)
 # is user-supplied and SLURM does not restrict commas, spaces, or pipes within
@@ -30,16 +34,25 @@ _FIELD_SEP = "|"
 _SQUEUE_FORMAT = f"%i{_FIELD_SEP}%T{_FIELD_SEP}%j"  # job_id, state, name
 _SACCT_FORMAT = "JobID,State,JobName"
 
+# Format for the ``--jobs=``-scoped squeue queries of the manager loop, which
+# also need each job's start time (``%S``; actual for running jobs, expected
+# for pending ones), since the registration grace period runs from it.
+_SQUEUE_TRACKED_FORMAT = f"%i{_FIELD_SEP}%T{_FIELD_SEP}%S{_FIELD_SEP}%j"
+
+# Format for failed jobs: ``ExitCode`` is ``<code>:<signal>``; ``Reason`` is
+# the last reason the job was pending (``None`` if there was none). Neither
+# contains ``|``, and the name stays last.
+_SACCT_FAILED_FORMAT = "JobID,State,ExitCode,Reason,JobName"
+
 # Formats for ``recover_jobs``, which also needs each job's submission time
 # (squeue ``%V``, sacct ``Submit``). The name stays last.
 _SQUEUE_RECOVER_FORMAT = f"%i{_FIELD_SEP}%T{_FIELD_SEP}%V{_FIELD_SEP}%j"
 _SACCT_RECOVER_FORMAT = "JobID,State,Submit,JobName"
 
 # How far back ``recover_jobs(include_finished=True)`` looks for finished jobs
-# (sacct ``--starttime``). Only the operator CLI asks for finished jobs. A week
-# covers a manager that has been down over a weekend; older jobs are
-# accounting history rather than anything to act on, and a longer window makes
-# sacct scan more of the user's history.
+# (sacct ``--starttime``). A week covers a manager that has been down over a
+# weekend; older jobs are accounting history rather than anything to act on,
+# and a longer window makes sacct scan more of the user's history.
 _FINISHED_LOOKBACK = "now-7days"
 
 # Attempts for the user-scoped recovery queries, and the delay before the
@@ -84,36 +97,25 @@ class SlurmBatchApi(HPCBatchApi):
     # HPCBatchApi interface
     # ------------------------------------------------------------------
 
-    def check_job_health(self) -> None:
-        """Raise :class:`JobFailureError` if any tracked job has failed."""
-        # ``_get_failed_jobs`` is already scoped to ``tracked_jobs`` via
-        # ``--jobs=``, so every result here is one of ours.
-        failed_jobs = self._get_failed_jobs()
-        if failed_jobs:
-            job_ids = ", ".join(job["job_id"] for job in failed_jobs)
-            raise JobFailureError(
-                f"Job(s) {job_ids} failed. "
-                "Check logs and cleanup before restarting the manager."
-            )
+    def find_unregistered_jobs(
+        self, server_job_names: Set[str]
+    ) -> List[Dict[str, str]]:
+        """Return running tracked SLURM jobs not registered with the server.
 
-    def verify_running_jobs(self, server_job_names: Set[str]) -> None:
-        """Verify each running tracked SLURM job is registered with the server.
-
-        Only jobs whose ``job_id`` is in ``self.tracked_jobs`` are validated.
+        Only jobs whose ``job_id`` is in ``self.tracked_jobs`` are checked.
         Other jobs with similar names (e.g. pre-existing user jobs) are
         ignored.
 
-        Jobs younger than ``settings.job_registration_grace_period`` seconds
-        are also skipped to avoid racing the compute service's registration
-        handshake.
-
-        Raises
-        ------
-        JobNotFoundError
-            If a tracked, running, past-grace job is not registered.
+        Jobs that started running less than
+        ``settings.job_registration_grace_period`` seconds ago (squeue
+        ``%S``) are left out, to avoid racing the compute service's
+        registration handshake. Time spent pending does not count. If the
+        start time cannot be parsed, the submission time is used instead.
         """
         grace = self.settings.job_registration_grace_period
+        now = datetime.now(tz=timezone.utc)
 
+        unregistered = []
         for job in self._get_running_jobs():
             job_id = job["job_id"]
             if job_id not in self.tracked_jobs:
@@ -122,43 +124,64 @@ class SlurmBatchApi(HPCBatchApi):
                 # user job) sharing our prefix.
                 continue
 
-            age = self._job_age(job_id)
+            started = _parse_slurm_time(job["started"])
+            age = now - started if started is not None else self._job_age(job_id)
             if age is not None and age.total_seconds() < grace:
                 # Still inside the registration window; the service may not
                 # have finished registering yet. Skip this cycle.
                 continue
 
             if job["name"] not in server_job_names:
-                raise JobNotFoundError(
-                    f"Job {job['name']} (SLURM ID: {job_id}) is running and "
-                    f"past its {grace}s registration grace period, but is not "
-                    "registered with the server. Check that the SLURM job "
-                    'script passes `--name "{{ JOB_NAME }}"` to '
-                    "`alchemiscale compute synchronous`."
+                unregistered.append(
+                    {"job_id": job_id, "name": job["name"], "state": job["state"]}
                 )
+        return unregistered
 
-    def clear_successful_jobs(self) -> None:
-        """Drop completed jobs from the in-memory tracking set.
+    def clear_successful_jobs(self) -> List[str]:
+        """Drop completed jobs from the in-memory tracking set, returning
+        their IDs.
 
         SLURM ``sacct`` records are immutable history, so there is nothing to
         delete on the cluster side; the manager simply forgets about jobs it
         no longer needs to monitor.
         """
         if not self.settings.cleanup_successful_jobs:
-            return
-        for job in self._get_completed_jobs():
-            self._untrack(job["job_id"])
+            return []
+        cleared = [job["job_id"] for job in self._get_completed_jobs()]
+        for job_id in cleared:
+            self._untrack(job_id)
+        return cleared
 
-    def clear_failed_jobs(self) -> None:
-        """Drop failed jobs from the in-memory tracking set.
+    def clear_failed_jobs(self) -> Dict[str, str]:
+        """Drop failed jobs from the in-memory tracking set, returning
+        ``{job_id: failure reason}``.
 
-        Same caveat as :meth:`clear_successful_jobs`: this is purely
-        in-memory; ``sacct`` records are not modified.
+        The reason combines sacct's ``State`` (e.g. ``TIMEOUT``,
+        ``NODE_FAIL``), ``ExitCode``, and ``Reason``. Same caveat as
+        :meth:`clear_successful_jobs`: this is purely in-memory; ``sacct``
+        records are not modified. Failed jobs are always untracked, since a
+        failed job left tracked would be reported again every cycle. sacct's
+        ``Reason`` is the last reason the job was pending, so it is labeled
+        as such.
         """
-        if not self.settings.cleanup_failed_jobs:
-            return
-        for job in self._get_failed_jobs():
+        return self._clear_ended_jobs(SLURM_FAILED_STATES)
+
+    def clear_cancelled_jobs(self) -> Dict[str, str]:
+        """Drop cancelled jobs from the in-memory tracking set, returning
+        ``{job_id: reason}``, e.g. ``CANCELLED by 1000, exit code 0, signal
+        15``. As with :meth:`clear_failed_jobs`, ``sacct`` records are not
+        modified.
+        """
+        return self._clear_ended_jobs(SLURM_CANCELLED_STATE)
+
+    def _clear_ended_jobs(self, states: str) -> Dict[str, str]:
+        """Untrack jobs that ended in one of ``states``, returning
+        ``{job_id: reason}``."""
+        ended = {}
+        for job in self._get_ended_jobs(states):
+            ended[job["job_id"]] = job["reason"]
             self._untrack(job["job_id"])
+        return ended
 
     def jobs_pending(self) -> bool:
         """Return True if any tracked jobs are in PENDING state."""
@@ -193,7 +216,14 @@ class SlurmBatchApi(HPCBatchApi):
     def submit_job(self, script_path: Path) -> str:
         """Submit a job script to SLURM and return the assigned job ID."""
         cmd = [self.settings.submit_command, *self._submit_options(), str(script_path)]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as e:
+            # The exception's own message omits stderr, which says why.
+            raise RuntimeError(
+                f"{cmd[0]} exited with code {e.returncode}: "
+                f"{(e.stderr or '').strip()}"
+            ) from e
 
         # sbatch output: "Submitted batch job 12345"
         match = re.search(r"Submitted batch job (\d+)", result.stdout)
@@ -241,7 +271,7 @@ class SlurmBatchApi(HPCBatchApi):
             _SQUEUE_RECOVER_FORMAT,
             "--noheader",
         ]
-        jobs = self._parse_jobs_with_submit(self._run_query(squeue_cmd))
+        jobs = self._parse_timed_jobs(self._run_query(squeue_cmd), "submitted")
 
         if include_finished:
             sacct_cmd = [
@@ -253,20 +283,20 @@ class SlurmBatchApi(HPCBatchApi):
                 "-E",
                 "now",
                 "-s",
-                f"COMPLETED,{SLURM_FAILED_STATES}",
+                f"COMPLETED,{SLURM_CANCELLED_STATE},{SLURM_FAILED_STATES}",
                 "-o",
                 _SACCT_RECOVER_FORMAT,
                 "--noheader",
                 "-X",  # only show main job, not steps
                 "-P",  # parsable output: pipe-separated, no padding
             ]
-            jobs += self._parse_jobs_with_submit(self._run_query(sacct_cmd))
+            jobs += self._parse_timed_jobs(self._run_query(sacct_cmd), "submitted")
 
         recovered = []
         for job in jobs:
             if not is_own_job_name(self.settings.name, job["name"]):
                 continue
-            self._track(job["job_id"], _parse_submit_time(job.pop("submitted")))
+            self._track(job["job_id"], _parse_slurm_time(job.pop("submitted")))
             recovered.append(job)
         return recovered
 
@@ -294,7 +324,8 @@ class SlurmBatchApi(HPCBatchApi):
         Filtering by ``--jobs=<tracked>`` (rather than scanning every job in
         the user's queue) sidesteps the cost of looking at unrelated jobs and
         also means a colocated workload that happens to share our prefix
-        cannot interfere.
+        cannot interfere. Each job also carries its start time as
+        ``started``; see :func:`_query_env` for the time format.
         """
         if not self.tracked_jobs:
             return []
@@ -303,14 +334,16 @@ class SlurmBatchApi(HPCBatchApi):
             "--jobs=" + ",".join(sorted(self.tracked_jobs)),
             "--states=" + state,
             "-o",
-            _SQUEUE_FORMAT,
+            _SQUEUE_TRACKED_FORMAT,
             "--noheader",
         ]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, check=True, env=_query_env()
+            )
         except subprocess.CalledProcessError:
             return []
-        return self._parse_jobs(result.stdout)
+        return self._parse_timed_jobs(result.stdout, "started")
 
     def _get_running_jobs(self) -> List[Dict[str, str]]:
         return self._squeue_tracked("RUNNING")
@@ -319,15 +352,31 @@ class SlurmBatchApi(HPCBatchApi):
         return self._squeue_tracked("PENDING")
 
     def _get_completed_jobs(self) -> List[Dict[str, str]]:
-        return self._sacct_query("COMPLETED", self.tracked_jobs)
+        return self._parse_jobs(
+            self._sacct_query("COMPLETED", self.tracked_jobs, _SACCT_FORMAT)
+        )
 
-    def _get_failed_jobs(self) -> List[Dict[str, str]]:
-        return self._sacct_query(SLURM_FAILED_STATES, self.tracked_jobs)
+    def _get_ended_jobs(self, states: str) -> List[Dict[str, str]]:
+        """Return tracked jobs that ended in one of the comma-separated
+        ``states``, each with a ``reason``.
+
+        ``sacct -s`` selects jobs that were in one of ``states`` at any time,
+        so a job that was preempted and requeued could match while it is
+        pending or running again. Only jobs whose current state is one of
+        ``states`` are returned.
+        """
+        jobs = self._parse_failed_jobs(
+            self._sacct_query(states, self.tracked_jobs, _SACCT_FAILED_FORMAT)
+        )
+        return [
+            job for job in jobs if job["state"].split(" ", 1)[0] in states.split(",")
+        ]
 
     def _sacct_query(
-        self, state_filter: str, job_ids: Iterable[str]
-    ) -> List[Dict[str, str]]:
-        """Run ``sacct`` for ``job_ids`` filtered to ``state_filter``.
+        self, state_filter: str, job_ids: Iterable[str], fields: str
+    ) -> str:
+        """Run ``sacct`` for ``job_ids`` filtered to ``state_filter``, and
+        return its parsable output with ``fields`` (``-o``).
 
         Scoping to specific job IDs via ``--jobs=`` neatly sidesteps the
         ``sacct`` default lookback window (typically "today only"), since
@@ -338,7 +387,7 @@ class SlurmBatchApi(HPCBatchApi):
         if not job_ids:
             # ``sacct`` without ``-j`` would scan all of today's jobs, which is
             # both wasteful and pulls in unrelated work; skip entirely.
-            return []
+            return ""
 
         cmd = [
             self.settings.accounting_command,
@@ -346,7 +395,7 @@ class SlurmBatchApi(HPCBatchApi):
             "-s",
             state_filter,
             "-o",
-            _SACCT_FORMAT,
+            fields,
             "--noheader",
             "-X",  # only show main job, not steps
             "-P",  # parsable output: pipe-separated, no padding
@@ -355,9 +404,9 @@ class SlurmBatchApi(HPCBatchApi):
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         except subprocess.CalledProcessError:
-            return []
+            return ""
 
-        return self._parse_jobs(result.stdout)
+        return result.stdout
 
     @staticmethod
     def _run_query(cmd: List[str]) -> str:
@@ -384,24 +433,59 @@ class SlurmBatchApi(HPCBatchApi):
         )
 
     @staticmethod
-    def _parse_jobs_with_submit(text: str) -> List[Dict[str, str]]:
-        """Parse pipe-separated ``job_id|state|submitted|name`` lines.
+    def _parse_timed_jobs(text: str, time_key: str) -> List[Dict[str, str]]:
+        """Parse pipe-separated ``job_id|state|<time>|name`` lines.
 
-        As in :meth:`_parse_jobs`, the name is last and may contain ``|``.
+        The time is stored under ``time_key`` (e.g. ``submitted``,
+        ``started``). As in :meth:`_parse_jobs`, the name is last and may
+        contain ``|``.
         """
         jobs: List[Dict[str, str]] = []
         for line in text.strip().splitlines():
             parts = line.split(_FIELD_SEP, 3)
             if len(parts) == 4:
-                job_id, state, submitted, name = parts
+                job_id, state, time_value, name = parts
                 jobs.append(
                     {
                         "job_id": job_id,
                         "state": state,
-                        "submitted": submitted,
+                        time_key: time_value,
                         "name": name,
                     }
                 )
+        return jobs
+
+    @staticmethod
+    def _parse_failed_jobs(text: str) -> List[Dict[str, str]]:
+        """Parse pipe-separated ``job_id|state|exit_code|reason|name`` lines.
+
+        Each job gets a ``reason`` summarizing why it failed, e.g.
+        ``CANCELLED by 1000, exit code 0, signal 15``. sacct's ``Reason`` is
+        the last reason the job was pending, not why it failed. As in
+        :meth:`_parse_jobs`, the name is last and may contain ``|``.
+        """
+        jobs: List[Dict[str, str]] = []
+        for line in text.strip().splitlines():
+            parts = line.split(_FIELD_SEP, 4)
+            if len(parts) != 5:
+                continue
+            job_id, state, exit_code, reason, name = parts
+            details = [state]
+            code, _, signal = exit_code.partition(":")
+            if code:
+                details.append(f"exit code {code}")
+            if signal and signal != "0":
+                details.append(f"signal {signal}")
+            if reason and reason != "None":
+                details.append(f"last pending reason {reason}")
+            jobs.append(
+                {
+                    "job_id": job_id,
+                    "state": state,
+                    "name": name,
+                    "reason": ", ".join(details),
+                }
+            )
         return jobs
 
     @staticmethod
@@ -422,8 +506,8 @@ class SlurmBatchApi(HPCBatchApi):
         return jobs
 
 
-def _parse_submit_time(value: str) -> Optional[datetime]:
-    """Parse a SLURM submit time (``YYYY-MM-DDTHH:MM:SS``, local) as UTC.
+def _parse_slurm_time(value: str) -> Optional[datetime]:
+    """Parse a SLURM time (``YYYY-MM-DDTHH:MM:SS``, local) as UTC.
 
     Returns None for values that are not timestamps (e.g. ``Unknown``).
     """
