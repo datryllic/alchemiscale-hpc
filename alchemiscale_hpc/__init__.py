@@ -9,6 +9,8 @@ Backend implementations live in subpackages (``alchemiscale_hpc.slurm``,
 themselves are always available; backends are imported lazily.
 """
 
+from importlib.metadata import version
+
 from .base import (
     HPCBatchApi,
     HPCManager,
@@ -22,6 +24,8 @@ from .base import (
     list_backends,
     register_backend,
 )
+
+__version__ = version("alchemiscale_hpc")
 
 __all__ = [
     "HPCBatchApi",
