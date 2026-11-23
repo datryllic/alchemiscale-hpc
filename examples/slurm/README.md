@@ -149,6 +149,15 @@ still registered keeps resetting the count until it ends (up to its
 walltime); only then does the limit apply. The new jobs' failures are
 logged at ERROR throughout.
 
+Jobs you cancel yourself with `scancel` are recorded as `CANCELLED` and count
+as failed too. Cancelling several while none of the manager's compute services
+is registered can stop it; stop the manager first if you need to cancel many
+of its jobs.
+
+Without SLURM accounting (`sacct`), the manager cannot see failed jobs at all:
+it logs a WARNING at startup, and `max_consecutive_failed_cycles` never stops
+it.
+
 Your job script must exit with the compute service's exit status, as the
 example template does: a job that exits 0 is recorded as `COMPLETED`, which
 counts as a sign of health, so a service that never started would otherwise
@@ -280,7 +289,8 @@ with `JobNotFoundError` again, until the job ends or you cancel it with
 - **PENDING**: Job is queued in SLURM, waiting for resources
 - **RUNNING**: Job is executing, compute service is active
 - **COMPLETED**: Job finished successfully, service deregistered
-- **FAILED** (or `TIMEOUT`, `CANCELLED`, `NODE_FAIL`, `PREEMPTED`): manager
+- **FAILED** (or `TIMEOUT`, `CANCELLED`, `NODE_FAIL`, `PREEMPTED`,
+  `OUT_OF_MEMORY`, `BOOT_FAIL`, `DEADLINE`): manager
   logs the reason and carries on; it stops only if jobs fail cycle after cycle
   (see [Failed Jobs](#failed-jobs))
 

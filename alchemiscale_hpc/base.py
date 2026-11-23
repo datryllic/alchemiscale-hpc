@@ -180,7 +180,8 @@ class HPCManagerSettings(ComputeManagerSettings):
             "this many cycles that submit while no compute service of this "
             "manager is registered. With a short sleep_interval, raise this "
             "limit so that a brief scheduler outage does not stop the "
-            "manager. 0 stops on the first failure; null never stops."
+            "manager. Jobs cancelled by the operator count as failed too. "
+            "0 stops on the first failure; null never stops."
         ),
     )
 
@@ -302,7 +303,11 @@ class ScriptTemplateHPCManagerSettings(HPCManagerSettings):
             "If True, the per-cycle ``clear_successful_jobs`` step is enabled. "
             "Backends interpret this differently: the SLURM backend drops "
             "completed jobs from its in-memory tracking set; the (future) "
-            "Kubernetes-style backends actually delete completed Job objects."
+            "Kubernetes-style backends actually delete completed Job objects. "
+            "A cleared job counts as a sign of health for "
+            "max_consecutive_failed_cycles, so if False, only registered "
+            "compute services do; the SLURM backend also keeps completed jobs "
+            "tracked, and queries them every cycle."
         ),
     )
     cleanup_failed_jobs: bool = Field(
@@ -433,7 +438,7 @@ class HPCBatchApi(ABC):
         """Stop tracking failed jobs, returning ``{job_id: failure reason}``.
 
         Each failed job is returned once: it is untracked, so later calls do
-        not report it again. Called every cycle by
+        not report it again. Called every ``OK``/``SKIP`` cycle by
         :meth:`HPCManager.handle_finished_jobs`, which logs the reasons and
         decides whether to stop, and once at startup for jobs recovered by
         :meth:`recover_jobs`. For Kubernetes-style backends, clearing would
@@ -621,19 +626,30 @@ class HPCManager(ComputeManager, ABC):
         One WARNING summarizes them, with each job and its reason at INFO.
         They do not count toward ``max_consecutive_failed_cycles``: some were
         already reported before the restart, and a restart should not bring
-        the manager closer to stopping. This only informs, so if finished
-        jobs cannot be recovered (e.g. accounting is disabled or its
-        database is down), a WARNING is logged and startup continues.
+        the manager closer to stopping. Jobs that completed before startup
+        are untracked too, without counting as a sign of health; otherwise,
+        with ``cleanup_successful_jobs`` off, they would stay tracked for the
+        life of the manager.
+
+        This only informs, so if finished jobs cannot be recovered (e.g.
+        accounting is disabled or its database is down), a WARNING is logged
+        and startup continues.
         """
+        queued = set(self.batch_api.tracked_jobs)
         try:
             self.batch_api.recover_jobs(include_finished=True)
         except Exception as e:
             self.logger.warning(
                 "Could not recover recently finished jobs from the batch "
-                f"system, so failures from before startup are not reported: {e}"
+                "system, so failures from before startup are not reported. If "
+                "the batch system's accounting is unavailable, jobs that fail "
+                "while the manager runs will not be detected either, and "
+                f"max_consecutive_failed_cycles cannot stop the manager: {e}"
             )
             return
         failed = self.batch_api.clear_failed_jobs()
+        for job_id in self.batch_api.tracked_jobs - queued:
+            self.batch_api._untrack(job_id)
         if not failed:
             return
         self.logger.warning(
@@ -677,9 +693,11 @@ class HPCManager(ComputeManager, ABC):
             self.consecutive_failed_cycles += 1
         limit = self.settings.max_consecutive_failed_cycles
         if limit is not None and self.consecutive_failed_cycles > limit:
+            checks = self.consecutive_failed_cycles
             raise JobFailureError(
-                f"Failed batch jobs found in {self.consecutive_failed_cycles} "
-                "cycles with no job completing or registering in between, "
+                f"Failed batch jobs found in {checks} check"
+                f"{'s' if checks != 1 else ''} with no job completing or "
+                "registering in between, "
                 f"exceeding max_consecutive_failed_cycles={limit}; most recent: "
                 f"{', '.join(failed)}. Check the job script template, the job "
                 "logs, and the manager and compute service settings."
@@ -927,9 +945,10 @@ class ScriptTemplateHPCManager(HPCManager):
         self.consecutive_failed_submission_cycles += 1
         limit = self.settings.max_consecutive_failed_cycles
         if limit is not None and self.consecutive_failed_submission_cycles > limit:
+            cycles = self.consecutive_failed_submission_cycles
             raise JobSubmissionError(
-                "Job submission failed in "
-                f"{self.consecutive_failed_submission_cycles} cycles with no "
+                f"Job submission failed in {cycles} "
+                f"cycle{'s' if cycles != 1 else ''} with no "
                 "compute service of this manager registered, exceeding "
                 f"max_consecutive_failed_cycles={limit}; most recent error: "
                 f"{error}. Check the job script template and the manager "

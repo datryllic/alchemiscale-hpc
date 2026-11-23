@@ -141,7 +141,7 @@ The package uses a modular architecture with two abstraction layers:
      Subclasses only implement `_create_batch_api` and `_create_job_script`.
    - `ScriptTemplateHPCManagerSettings(HPCManagerSettings)`: adds
      `job_script_template`, `job_script_dir`, `keep_job_scripts`,
-     `cleanup_successful_jobs`, `cleanup_failed_jobs`.
+     `cleanup_successful_jobs`.
 
 3. **Backend registry**: each backend self-registers via
    `register_backend(name, Manager, Settings, BatchApi)` in its package

@@ -6,11 +6,14 @@ import time
 import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
-from alchemiscale.storage.models import ComputeManagerInstruction
+from alchemiscale.storage.models import (
+    ComputeManagerInstruction,
+    ComputeManagerStatus,
+)
 
 from alchemiscale_hpc import (
     HPCBatchApi,
@@ -1426,7 +1429,8 @@ def test_manager_start_logs_failures_without_counting_them(
 ):
     """Jobs that failed while the manager was down are summarized at WARNING
     and listed with their reasons at INFO, untracked, and not counted toward
-    max_consecutive_failed_cycles, even with a limit of 0."""
+    max_consecutive_failed_cycles, even with a limit of 0. Jobs that completed
+    before startup are untracked as well."""
     settings = slurm_settings.model_copy(update={"max_consecutive_failed_cycles": 0})
     mgr = _build_manager(settings, tmp_path)
     name = settings.name
@@ -1457,7 +1461,8 @@ def test_manager_start_logs_failures_without_counting_them(
     assert ("INFO", "Batch job 7 failed before startup: TIMEOUT, exit code 0") in (
         records
     )
-    assert mgr.batch_api.tracked_jobs == {"5", "8"}
+    # The completed job is untracked too, without counting as health.
+    assert mgr.batch_api.tracked_jobs == {"5"}
     assert mgr.consecutive_failed_cycles == 0
 
 
@@ -1685,7 +1690,7 @@ def test_failed_cycles_raise_after_default_limit(
         _check(mgr, {str(i): "FAILED"})
     with pytest.raises(
         JobFailureError,
-        match=r"6 cycles with no job completing or registering in between, "
+        match=r"6 checks with no job completing or registering in between, "
         r"exceeding max_consecutive_failed_cycles=5; most recent: 5, 6\. "
         r"Check the job script template",
     ):
@@ -1870,6 +1875,89 @@ def test_submission_failures_raise_after_limit(
     ) as excinfo:
         _submit_cycles(mgr, [[fail]])
     assert excinfo.value.__cause__ is fail
+
+
+def _run_against_fake_slurm(mgr, sbatch_error=None, max_cycles=100):
+    """Run ``mgr.start()`` against a fake SLURM in which each job pends for
+    one cycle and then fails, or ``sbatch`` fails with ``sbatch_error``.
+    The server never sees a compute service. Returns the number of cycles
+    completed (the one that raised is not) and the exception ``start()``
+    raised."""
+    jobs = {}  # job ID -> state
+    cycles = [0]
+
+    def run(cmd, **kwargs):
+        if cmd[0] == "sbatch":
+            if sbatch_error:
+                raise subprocess.CalledProcessError(1, cmd, "", sbatch_error)
+            job_id = str(100 + len(jobs))
+            jobs[job_id] = "PENDING"
+            return _Result(f"Submitted batch job {job_id}\n")
+        if "-u" in cmd:  # recovery: nothing from before startup
+            return _Result()
+        ids = next(a for a in cmd if a.startswith("--jobs=")).split("=")[1]
+        ids = [i for i in ids.split(",") if i in jobs]
+        if cmd[0] == "squeue":
+            state = next(a for a in cmd if a.startswith("--states=")).split("=")[1]
+            return _Result(
+                "".join(f"{i}|{state}|Unknown|x\n" for i in ids if jobs[i] == state)
+            )
+        states = cmd[cmd.index("-s") + 1].split(",")
+        return _Result(
+            "".join(
+                f"{i}|{jobs[i]}|1:0|None|x\n" for i in ids if jobs[i] in states
+            )
+        )
+
+    def sleep(seconds):
+        cycles[0] += 1
+        for job_id in jobs:
+            jobs[job_id] = "FAILED"
+
+    mgr.client.get_instruction.return_value = (
+        ComputeManagerInstruction.OK,
+        {"compute_service_ids": [], "num_tasks": 10},
+    )
+    mgr.int_sleep = MagicMock(side_effect=sleep)
+    with patch("subprocess.run", side_effect=run), patch(
+        "alchemiscale_hpc.slurm.manager._whoami", return_value="alice"
+    ), patch("alchemiscale_hpc.slurm.manager.time.sleep"):
+        with pytest.raises(Exception) as excinfo:
+            mgr.start(max_cycles=max_cycles)
+    return cycles[0], excinfo.value
+
+
+@pytest.mark.parametrize(
+    "sbatch_error, error, completed",
+    [
+        # Jobs submitted in cycle 1 fail in cycle 2, and so on; the 6th
+        # failing check, in cycle 7, raises.
+        (None, JobFailureError, 6),
+        # Every cycle submits and fails; the 6th raises.
+        (
+            "sbatch: error: invalid partition specified: x",
+            JobSubmissionError,
+            5,
+        ),
+    ],
+)
+def test_manager_stops_and_deregisters_on_repeated_failures(
+    slurm_settings: SlurmManagerSettings,
+    tmp_path: Path,
+    sbatch_error,
+    error,
+    completed,
+):
+    """Through ``start()``, a broken template or broken settings stop the
+    manager after the default limit, setting ERROR and deregistering."""
+    mgr = _build_manager(slurm_settings, tmp_path)
+    ran, raised = _run_against_fake_slurm(mgr, sbatch_error)
+    assert isinstance(raised, error)
+    assert ran == completed
+    if sbatch_error:
+        assert sbatch_error in str(raised)
+    assert mgr.client.update_status.call_args.args[1] == ComputeManagerStatus.ERROR
+    mgr.client.deregister.assert_called_once()
 
 
 def test_submission_failures_limit_zero_and_none(

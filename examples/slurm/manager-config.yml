@@ -78,7 +78,9 @@ max_consecutive_failed_cycles: 5
 # interpret these flags as actually deleting Job objects from the batch
 # system.)
 
-# Run the per-cycle clear_successful_jobs step (default: true).
+# Run the per-cycle clear_successful_jobs step (default: true). Leave it on:
+# a completed job counts as a sign of health for max_consecutive_failed_cycles,
+# and with it off, completed jobs stay tracked and are queried every cycle.
 cleanup_successful_jobs: true
 
 # cleanup_failed_jobs is ignored, and setting it to false warns: failed jobs
